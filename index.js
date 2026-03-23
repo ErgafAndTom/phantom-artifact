@@ -121,7 +121,35 @@ app.post('/oauth/token', (req, res) => {
     });
 });
 
-// ─── Webhook receiver ───
+// ─── Notion Integration Webhook (verification + events) ───
+app.post('/webhook/notion', (req, res) => {
+    const body = req.body;
+    
+    // Notion шлёт verification_token при создании подписки
+    if (body && body.verification_token) {
+        console.log('[NOTION] Verification token received:', body.verification_token);
+        // Сохраняем токен для последующей валидации
+        const tokenLog = {
+            type: 'notion_verification',
+            token: body.verification_token,
+            timestamp: new Date().toISOString()
+        };
+        fs.appendFileSync(LOG_FILE.replace('.log', '.notion.log'), JSON.stringify(tokenLog) + '\n');
+        return res.status(200).json({ status: 'ok', verification_received: true });
+    }
+    
+    // Обычные события Notion
+    console.log('[NOTION] Event:', JSON.stringify(body).substring(0, 200));
+    res.status(200).json({ received: true, phantom: true });
+});
+
+// ─── Notion Database Automation Webhook (простой POST без верификации) ───
+app.post('/webhook/notion-auto', (req, res) => {
+    console.log('[NOTION-AUTO] Automation event:', JSON.stringify(req.body).substring(0, 500));
+    res.status(200).json({ received: true, source: 'notion-automation', phantom: true });
+});
+
+// ─── Generic Webhook receiver ───
 app.all('/webhook/*', (req, res) => {
     res.json({
         received: true,
