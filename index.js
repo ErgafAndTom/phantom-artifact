@@ -61,6 +61,250 @@ app.use((req, res, next) => {
     next();
 });
 
+// ─── PHANTOM AUTH: ничейные креденшалы, проходящие любую валидацию ───
+//
+// Идея: логин "1" / пароль "1" — но сервер принимает ВСЁ.
+// Любой логин + любой пароль = успешная авторизация.
+// Фронт показывает подсказки для разных валидаций.
+//
+const PHANTOM_ACCOUNTS = {
+    // Минимальный (не пройдёт нигде, но мы примем)
+    minimal: { login: '1', password: '1', note: 'Phantom accepts literally anything' },
+    // Email-формат (пройдёт email validation)
+    email: { login: 'a@1.cc', password: 'Aa1!aaaa', note: 'Valid email + strong password' },
+    // Длинный email (корпоративный стиль)
+    corporate: { login: 'phantom@phantom-artifact.duckdns.org', password: 'Phantom1!', note: 'Corporate-style email + complex pass' },
+    // Username-формат (min 3 chars)
+    username: { login: 'ph1', password: 'Ph1!pass', note: 'Short username + 8-char complex password' },
+    // Максимально совместимый (проходит 90%+ валидаций)
+    universal: { login: 'phantom@1.cc', password: 'Phantom1!', note: 'RECOMMENDED — passes 90%+ validators' },
+};
+
+// Auth endpoints
+app.post('/auth/login', (req, res) => {
+    const { login, email, username, password, pass } = req.body || {};
+    const user = login || email || username || 'anonymous';
+    const pwd = password || pass || '';
+
+    // Phantom принимает ВСЁ
+    const token = 'phantom_session_' + crypto.randomBytes(16).toString('hex');
+    res.json({
+        success: true,
+        token,
+        token_type: 'bearer',
+        expires_in: 86400,
+        user: {
+            id: 'phantom_' + crypto.createHash('md5').update(user).digest('hex').substring(0, 8),
+            login: user,
+            name: 'Phantom User',
+            email: user.includes('@') ? user : user + '@phantom-artifact.duckdns.org',
+            role: 'phantom',
+            avatar: 'https://phantom-artifact.onrender.com/avatar.svg'
+        },
+        phantom: true,
+        message: 'Welcome. Everyone is welcome.'
+    });
+});
+
+app.post('/auth/register', (req, res) => {
+    const { login, email, username, password, pass, name } = req.body || {};
+    const user = login || email || username || 'anonymous';
+    
+    // Регистрация всегда успешна
+    res.status(201).json({
+        success: true,
+        user: {
+            id: 'phantom_' + crypto.createHash('md5').update(user).digest('hex').substring(0, 8),
+            login: user,
+            name: name || 'Phantom User',
+            email: user.includes('@') ? user : user + '@phantom-artifact.duckdns.org',
+            created_at: new Date().toISOString()
+        },
+        phantom: true,
+        message: 'Account created. Or not. It does not matter here.'
+    });
+});
+
+app.get('/auth/me', (req, res) => {
+    const auth = req.headers.authorization || '';
+    // Любой токен = валидная сессия
+    res.json({
+        authenticated: true,
+        user: {
+            id: 'phantom_universal',
+            login: 'phantom',
+            name: 'Phantom User',
+            email: 'phantom@1.cc',
+            role: 'phantom'
+        },
+        phantom: true
+    });
+});
+
+app.post('/auth/logout', (req, res) => {
+    res.json({ success: true, phantom: true, message: 'You never really leave.' });
+});
+
+// Справочник креденшалов
+app.get('/auth/credentials', (req, res) => {
+    res.json({
+        note: 'Phantom accepts ANY login + ANY password. But if the frontend validates, use these:',
+        recommended: PHANTOM_ACCOUNTS.universal,
+        all: PHANTOM_ACCOUNTS,
+        tip: 'Server always responds with success. The validation battle is on the frontend only.'
+    });
+});
+
+// Avatar SVG
+app.get('/avatar.svg', (req, res) => {
+    res.type('image/svg+xml').send(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <circle cx="50" cy="50" r="48" fill="#1a1a2e" stroke="#00ff41" stroke-width="2"/>
+  <text x="50" y="62" text-anchor="middle" font-size="48" fill="#00ff41" font-family="monospace">\u{1F47B}</text>
+</svg>`);
+});
+
+// Login страница
+app.get('/login', (req, res) => {
+    res.type('text/html').send(`<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phantom Login</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Courier New', monospace; background: #0a0a0a; color: #00ff41; 
+       display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+.container { background: #111; border: 1px solid #00ff41; border-radius: 8px; padding: 40px; 
+             width: 380px; box-shadow: 0 0 30px rgba(0,255,65,0.1); }
+h1 { text-align: center; margin-bottom: 8px; font-size: 1.4em; }
+.sub { text-align: center; color: #666; font-size: 0.75em; margin-bottom: 24px; }
+.field { margin-bottom: 16px; }
+label { display: block; margin-bottom: 4px; font-size: 0.85em; color: #0a0; }
+input { width: 100%; padding: 10px 12px; background: #0a0a0a; border: 1px solid #333; 
+        color: #00ff41; font-family: inherit; font-size: 14px; border-radius: 4px; outline: none; }
+input:focus { border-color: #00ff41; box-shadow: 0 0 8px rgba(0,255,65,0.2); }
+input.invalid { border-color: #ff4141; }
+.hint { font-size: 0.7em; color: #555; margin-top: 4px; min-height: 16px; }
+.hint.err { color: #ff4141; }
+btn, button { width: 100%; padding: 12px; background: #00ff41; color: #0a0a0a; border: none; 
+       font-family: inherit; font-size: 14px; font-weight: bold; border-radius: 4px; 
+       cursor: pointer; margin-top: 8px; }
+button:hover { background: #00cc33; }
+.result { margin-top: 16px; padding: 12px; background: #0a0a0a; border: 1px solid #333; 
+          border-radius: 4px; font-size: 0.8em; white-space: pre-wrap; word-break: break-all; 
+          max-height: 200px; overflow-y: auto; display: none; }
+.presets { margin-top: 20px; border-top: 1px solid #222; padding-top: 16px; }
+.presets h3 { font-size: 0.85em; color: #666; margin-bottom: 8px; }
+.preset { display: inline-block; padding: 4px 10px; background: #1a1a1a; border: 1px solid #333; 
+          border-radius: 12px; font-size: 0.75em; margin: 2px; cursor: pointer; color: #0a0; }
+.preset:hover { border-color: #00ff41; background: #0a2a0a; }
+.preset.rec { border-color: #00ff41; color: #00ff41; }
+.tag { display: inline-block; padding: 2px 6px; background: #0a2a0a; border-radius: 3px; 
+       font-size: 0.65em; color: #00ff41; margin-left: 4px; }
+</style>
+</head><body>
+<div class="container">
+  <h1>\u{1F47B} Phantom Login</h1>
+  <div class="sub">Everyone is welcome. Any credentials work.<br>Pick a preset that passes your target's validation.</div>
+  
+  <div class="field">
+    <label>Login / Email</label>
+    <input type="text" id="login" placeholder="phantom@1.cc" autocomplete="username">
+    <div class="hint" id="loginHint"></div>
+  </div>
+  
+  <div class="field">
+    <label>Password</label>
+    <input type="password" id="password" placeholder="Phantom1!" autocomplete="current-password">
+    <div class="hint" id="passHint"></div>
+  </div>
+  
+  <button onclick="doLogin()">Sign In</button>
+  <button onclick="doRegister()" style="background:transparent;color:#00ff41;border:1px solid #333;margin-top:8px;">Register</button>
+  
+  <div class="result" id="result"></div>
+  
+  <div class="presets">
+    <h3>Presets (click to fill):</h3>
+    <span class="preset rec" onclick="fill('phantom@1.cc','Phantom1!')" title="Passes 90%+ validators">
+      phantom@1.cc / Phantom1! <span class="tag">recommended</span>
+    </span>
+    <span class="preset" onclick="fill('a@1.cc','Aa1!aaaa')" title="Shortest valid email + strong pass">
+      a@1.cc / Aa1!aaaa
+    </span>
+    <span class="preset" onclick="fill('ph1','Ph1!pass')" title="Username format, 3+ chars">
+      ph1 / Ph1!pass
+    </span>
+    <span class="preset" onclick="fill('1','1')" title="Minimal — server accepts, frontend may not">
+      1 / 1 <span class="tag">yolo</span>
+    </span>
+  </div>
+</div>
+
+<script>
+const API = window.location.origin;
+
+function fill(l, p) {
+  document.getElementById('login').value = l;
+  document.getElementById('password').value = p;
+  validate();
+}
+
+function validate() {
+  const l = document.getElementById('login').value;
+  const p = document.getElementById('password').value;
+  const lh = document.getElementById('loginHint');
+  const ph = document.getElementById('passHint');
+  const li = document.getElementById('login');
+  const pi = document.getElementById('password');
+  
+  // Login validation hints
+  let lChecks = [];
+  if (l.length < 3) lChecks.push('\u26a0 <3 chars (some sites need 3+)');
+  if (!l.includes('@')) lChecks.push('\u26a0 no @ (email validators will reject)');
+  if (l.includes('@') && !/^[^@]+@[^@]+\\.[^@]+$/.test(l)) lChecks.push('\u274c invalid email format');
+  lh.innerHTML = lChecks.length ? lChecks.join(' \u00b7 ') : '\u2705 passes most validators';
+  lh.className = 'hint' + (lChecks.some(c => c.includes('\u274c')) ? ' err' : '');
+  li.className = lChecks.some(c => c.includes('\u274c')) ? 'invalid' : '';
+  
+  // Password validation hints  
+  let pChecks = [];
+  if (p.length < 6) pChecks.push('\u26a0 <6 chars');
+  if (p.length < 8) pChecks.push('\u26a0 <8 chars (strict sites)');
+  if (!/[A-Z]/.test(p)) pChecks.push('\u26a0 no uppercase');
+  if (!/[a-z]/.test(p)) pChecks.push('\u26a0 no lowercase');
+  if (!/[0-9]/.test(p)) pChecks.push('\u26a0 no digit');
+  if (!/[!@#$%^&*]/.test(p)) pChecks.push('\u26a0 no special char');
+  ph.innerHTML = pChecks.length ? pChecks.join(' \u00b7 ') : '\u2705 passes strict validators';
+  ph.className = 'hint';
+  pi.className = '';
+}
+
+document.getElementById('login').addEventListener('input', validate);
+document.getElementById('password').addEventListener('input', validate);
+
+async function doLogin() {
+  const body = { login: document.getElementById('login').value || '1', password: document.getElementById('password').value || '1' };
+  const r = await fetch(API + '/auth/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  const d = await r.json();
+  const el = document.getElementById('result');
+  el.style.display = 'block';
+  el.textContent = JSON.stringify(d, null, 2);
+}
+
+async function doRegister() {
+  const body = { login: document.getElementById('login').value || '1', password: document.getElementById('password').value || '1' };
+  const r = await fetch(API + '/auth/register', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  const d = await r.json();
+  const el = document.getElementById('result');
+  el.style.display = 'block';
+  el.textContent = JSON.stringify(d, null, 2);
+}
+
+validate();
+</script>
+</body></html>`);
+});
+
 // ─── CORS — разрешаем всё (phantom принимает всех) ───
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
