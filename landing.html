@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phantom Artifact</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0a;--surface:#111;--border:#1a1a1a;--border2:#222;--green:#00ff41;--green2:#0a2a0a;--dim:#444;--text:#999;--bright:#ccc;--blue:#4fc3f7;--orange:#ffb74d;--red:#ef5350;--purple:#ce93d8;--cyan:#00bcd4;--yellow:#ffd740}
+body{font-family:'JetBrains Mono','Fira Code','Courier New',monospace;background:var(--bg);color:var(--text);min-height:100vh}
+.terminal{max-width:1100px;margin:0 auto;padding:20px}
+.top{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--border2);margin-bottom:20px}
+.top h1{color:var(--green);font-size:1.1em;letter-spacing:1px}
+.top .meta{font-size:0.7em;color:var(--dim)}
+.live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);margin-right:4px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.badge{background:var(--green);color:var(--bg);padding:2px 8px;border-radius:10px;font-size:0.65em;font-weight:bold}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+@media(max-width:700px){.grid{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--border2);border-radius:6px;padding:14px}
+.card h3{color:var(--green);font-size:0.78em;margin-bottom:10px;text-transform:uppercase;letter-spacing:1px}
+.card.wide{grid-column:1/-1}
+.big-nums{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+.big-num{background:var(--surface);border:1px solid var(--border2);border-radius:6px;padding:14px 20px;flex:1;min-width:120px;text-align:center}
+.big-num .val{font-size:1.8em;color:var(--green);font-weight:bold;line-height:1}
+.big-num .label{font-size:0.65em;color:var(--dim);margin-top:4px;text-transform:uppercase}
+.bar-chart{display:flex;flex-direction:column;gap:4px}
+.bar-row{display:flex;align-items:center;gap:8px;font-size:0.75em}
+.bar-row .bar-label{width:90px;text-align:right;color:var(--text);flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-row .bar-track{flex:1;height:18px;background:var(--bg);border-radius:2px;overflow:hidden;position:relative}
+.bar-row .bar-fill{height:100%;border-radius:2px;transition:width .5s ease;min-width:2px}
+.bar-row .bar-count{width:40px;text-align:right;color:var(--dim);flex-shrink:0;font-size:0.85em}
+.timeline-chart{height:60px;display:flex;align-items:flex-end;gap:1px;padding:4px 0}
+.timeline-bar{flex:1;background:var(--green);border-radius:1px 1px 0 0;min-width:2px;transition:height .5s ease;opacity:.7;position:relative}
+.timeline-bar:hover{opacity:1}
+.timeline-labels{display:flex;justify-content:space-between;font-size:0.6em;color:var(--dim);margin-top:2px}
+.flow-table{width:100%;font-size:0.72em;border-collapse:collapse}
+.flow-table th{text-align:left;color:var(--dim);font-weight:normal;padding:4px 8px;border-bottom:1px solid var(--border2)}
+.flow-table td{padding:4px 8px;border-bottom:1px solid var(--border)}
+.flow-table .flow-arrow{color:var(--dim)}
+.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:0.85em}
+.t-webhook{background:#1a2a1a;color:#81c784}.t-oauth{background:#1a1a2a;color:#90caf9}
+.t-payment{background:#2a2a1a;color:var(--orange)}.t-api{background:#1a1a1a;color:#aaa}
+.t-health-check{background:#0a2a2a;color:var(--blue)}.t-unknown{background:#1a1a1a;color:#666}
+.t-tool-request{background:#2a1a2a;color:var(--purple)}
+.recent{font-size:0.72em}
+.recent-row{display:flex;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);align-items:center}
+.recent-row .time{color:var(--dim);width:55px;flex-shrink:0}
+.recent-row .method{width:40px;font-weight:bold;flex-shrink:0}
+.m-GET{color:var(--blue)}.m-POST{color:#81c784}.m-PUT{color:var(--orange)}.m-DELETE{color:var(--red)}.m-PATCH{color:var(--purple)}
+.recent-row .rpath{color:var(--bright);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.c-high{color:#81c784}.c-medium{color:var(--orange)}.c-low{color:var(--red)}
+.nav{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.nav a{color:var(--green);text-decoration:none;border:1px solid var(--border2);padding:6px 14px;border-radius:4px;font-size:0.75em;transition:all .15s}
+.nav a:hover{border-color:var(--green);background:var(--green2)}
+.prompt{margin-top:20px;padding:12px 0;border-top:1px solid var(--border2);font-size:0.75em;color:var(--dim)}
+.prompt span{color:var(--green)}
+.cursor{display:inline-block;width:8px;height:14px;background:var(--green);animation:blink 1s step-end infinite;vertical-align:text-bottom;margin-left:2px}
+@keyframes blink{50%{opacity:0}}
+.clr-0{background:var(--green)}.clr-1{background:var(--blue)}.clr-2{background:var(--orange)}.clr-3{background:var(--purple)}.clr-4{background:var(--cyan)}.clr-5{background:var(--yellow)}.clr-6{background:var(--red)}.clr-7{background:#66bb6a}
+
+/* Pixel video */
+.pixvid{background:var(--surface);border:1px solid var(--border2);border-radius:6px;padding:14px;margin-bottom:16px;position:relative}
+.pixvid h3{color:var(--green);font-size:0.78em;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
+.pixvid canvas{display:block;width:100%;image-rendering:pixelated;image-rendering:crisp-edges;border-radius:3px;border:1px solid var(--border2);background:#000}
+.pixvid .pv-legend{display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;font-size:0.6em}
+.pixvid .pv-legend span{display:flex;align-items:center;gap:3px;color:var(--dim)}
+.pixvid .pv-legend .dot{width:6px;height:6px;border-radius:1px}
+.pixvid .pv-meta{position:absolute;top:14px;right:14px;font-size:0.6em;color:var(--dim)}
+</style></head><body>
+<div class="terminal">
+
+<div class="top">
+  <h1>&#x1F47B; phantom-artifact <span style="color:var(--dim);font-size:0.7em">v2</span></h1>
+  <div class="meta"><span class="badge"><span class="live-dot"></span>LIVE</span> &nbsp; <span id="uptime">0s</span></div>
+</div>
+
+<div class="nav">
+  <a href="/inspector">&#x1F50D; Inspector</a>
+  <a href="/echo/test">&#x1FA9E; Echo</a>
+  <a href="/identity">&#x1F4CB; Identity</a>
+  <a href="/logs">&#x1F4DC; Logs</a>
+  <a href="/stats">&#x1F4CA; Stats JSON</a>
+  <a href="https://github.com/ErgafAndTom/phantom-artifact" target="_blank">&#x1F4BB; GitHub</a>
+</div>
+
+<div class="big-nums">
+  <div class="big-num"><div class="val" id="s-total">0</div><div class="label">Requests</div></div>
+  <div class="big-num"><div class="val" id="s-types">0</div><div class="label">Types Seen</div></div>
+  <div class="big-num"><div class="val" id="s-sources">0</div><div class="label">Sources</div></div>
+  <div class="big-num"><div class="val" id="s-ips">0</div><div class="label">Unique IPs</div></div>
+</div>
+
+<div class="pixvid">
+  <h3>&#x1F4A0; Live Pixel Feed</h3>
+  <span class="pv-meta" id="pv-meta">0 px</span>
+  <canvas id="pv-canvas" width="64" height="32"></canvas>
+  <div class="pv-legend">
+    <span><span class="dot" style="background:#00ff41"></span>webhook</span>
+    <span><span class="dot" style="background:#4fc3f7"></span>oauth</span>
+    <span><span class="dot" style="background:#ffb74d"></span>payment</span>
+    <span><span class="dot" style="background:#aaa"></span>api</span>
+    <span><span class="dot" style="background:#00bcd4"></span>health</span>
+    <span><span class="dot" style="background:#ce93d8"></span>tool</span>
+    <span><span class="dot" style="background:#333"></span>unknown</span>
+  </div>
+</div>
+
+<div class="card wide">
+  <h3>&#x1F4C8; Requests / Minute</h3>
+  <div class="timeline-chart" id="chart-timeline"></div>
+  <div class="timeline-labels" id="chart-timeline-labels"></div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>&#x1F3AF; By Type (Predict)</h3>
+    <div class="bar-chart" id="chart-type"></div>
+  </div>
+  <div class="card">
+    <h3>&#x1F310; By Source</h3>
+    <div class="bar-chart" id="chart-source"></div>
+  </div>
+  <div class="card">
+    <h3>&#x1F6E0;&#xFE0F; By Method</h3>
+    <div class="bar-chart" id="chart-method"></div>
+  </div>
+  <div class="card">
+    <h3>&#x1F916; By Client</h3>
+    <div class="bar-chart" id="chart-ua"></div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>&#x1F525; Top Paths</h3>
+    <div class="bar-chart" id="chart-paths"></div>
+  </div>
+  <div class="card">
+    <h3>&#x1F4E1; Recent Requests</h3>
+    <div class="recent" id="recent-list"></div>
+  </div>
+</div>
+
+<div class="card wide">
+  <h3>&#x1F504; Flow Map (source &#x2192; type &#x2192; path)</h3>
+  <table class="flow-table" id="flow-table">
+    <thead><tr><th>Source</th><th></th><th>Type</th><th></th><th>Path</th><th>Count</th><th>Last</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="prompt">
+  <span>phantom@artifact</span>:<span style="color:var(--blue)">~</span>$ curl <span id="pv-url"></span>/webhook/test<span class="cursor"></span>
+</div>
+
+</div>
+
+<script>
+var COLORS = ['clr-0','clr-1','clr-2','clr-3','clr-4','clr-5','clr-6','clr-7'];
+var TYPE_COLORS = {webhook:'var(--green)',oauth:'var(--blue)',payment:'var(--orange)',api:'#aaa','health-check':'var(--cyan)',unknown:'#666','tool-request':'var(--purple)'};
+var METHOD_COLORS = {GET:'var(--blue)',POST:'#81c784',PUT:'var(--orange)',DELETE:'var(--red)',PATCH:'var(--purple)',OPTIONS:'#666'};
+
+// --- Pixel Video ---
+var PV_W = 64, PV_H = 32;
+var pvCanvas = document.getElementById('pv-canvas');
+var pvCtx = pvCanvas.getContext('2d');
+var pvMeta = document.getElementById('pv-meta');
+var pvPixels = 0;
+var PV_TYPE_RGB = {
+  webhook: [0,255,65],
+  oauth: [79,195,247],
+  payment: [255,183,77],
+  api: [170,170,170],
+  'health-check': [0,188,212],
+  'tool-request': [206,147,216],
+  unknown: [51,51,51]
+};
+
+pvCtx.fillStyle = '#000';
+pvCtx.fillRect(0, 0, PV_W, PV_H);
+document.getElementById('pv-url').textContent = window.location.origin;
+
+function pvPushPixel(type) {
+  var x = pvPixels % PV_W;
+  var y = Math.floor(pvPixels / PV_W) % PV_H;
+
+  if (pvPixels > 0 && x === 0 && pvPixels >= PV_W * PV_H) {
+    var img = pvCtx.getImageData(0, 1, PV_W, PV_H - 1);
+    pvCtx.putImageData(img, 0, 0);
+    pvCtx.fillStyle = '#000';
+    pvCtx.fillRect(0, PV_H - 1, PV_W, 1);
+  }
+
+  var rgb = PV_TYPE_RGB[type] || PV_TYPE_RGB.unknown;
+  var v = 0.7 + Math.random() * 0.3;
+  var fy = pvPixels >= PV_W * PV_H ? PV_H - 1 : y;
+  var fx = pvPixels >= PV_W * PV_H ? pvPixels % PV_W : x;
+
+  pvCtx.fillStyle = 'rgb(' + Math.floor(rgb[0]*v) + ',' + Math.floor(rgb[1]*v) + ',' + Math.floor(rgb[2]*v) + ')';
+  pvCtx.fillRect(fx, fy, 1, 1);
+  pvPixels++;
+  pvMeta.textContent = pvPixels + ' px';
+}
+
+var pvLastTotal = 0;
+
+var es = new EventSource('/stats/events');
+es.onmessage = function(e) {
+    try {
+      var s = JSON.parse(e.data);
+      if (s.total > pvLastTotal && s.recentPredictions) {
+        var newCount = Math.min(s.total - pvLastTotal, 20);
+        var recent = s.recentPredictions.slice(0, newCount).reverse();
+        recent.forEach(function(r) { pvPushPixel(r.type); });
+        pvLastTotal = s.total;
+      }
+      update(s);
+    } catch(err) { console.error(err); }
+};
+
+function update(s) {
+    document.getElementById('s-total').textContent = s.total;
+    document.getElementById('s-types').textContent = Object.keys(s.byType || {}).length;
+    document.getElementById('s-sources').textContent = Object.keys(s.bySource || {}).length;
+    document.getElementById('s-ips').textContent = (s.topIPs || []).length;
+    document.getElementById('uptime').textContent = formatUptime(s.uptime || 0);
+    renderTimeline(s.minuteTimeline || []);
+    renderBars('chart-type', s.byType, TYPE_COLORS);
+    renderBars('chart-source', s.bySource);
+    renderBars('chart-method', s.byMethod, METHOD_COLORS);
+    renderBars('chart-ua', s.byUserAgent);
+    renderBars('chart-paths', Object.fromEntries((s.topPaths||[]).map(function(p){return [p.path,p.count]})));
+    renderRecent(s.recentPredictions || []);
+    renderFlow(s.flowMap || []);
+}
+
+function renderBars(id, data, colorMap) {
+    var el = document.getElementById(id);
+    if (!data || !Object.keys(data).length) { el.innerHTML = '<div style="color:var(--dim);font-size:0.75em;padding:8px">No data yet</div>'; return; }
+    var sorted = Object.entries(data).sort(function(a,b){return b[1]-a[1]}).slice(0,8);
+    var max = sorted[0][1] || 1;
+    el.innerHTML = sorted.map(function(item,i) {
+        var key = item[0], val = item[1];
+        var pct = Math.max((val/max)*100, 2);
+        var color = colorMap ? (colorMap[key] || 'var(--green)') : 'var(--green)';
+        var clr = colorMap ? '' : COLORS[i % COLORS.length];
+        return '<div class="bar-row">'
+            + '<span class="bar-label" title="'+esc(key)+'">'+esc(key)+'</span>'
+            + '<span class="bar-track"><span class="bar-fill '+clr+'" style="width:'+pct+'%;'+(colorMap?'background:'+color:'')+'">&nbsp;</span></span>'
+            + '<span class="bar-count">'+val+'</span>'
+            + '</div>';
+    }).join('');
+}
+
+function renderTimeline(data) {
+    var el = document.getElementById('chart-timeline');
+    var labels = document.getElementById('chart-timeline-labels');
+    if (!data.length) { el.innerHTML = '<div style="color:var(--dim);font-size:0.75em;padding:20px">Waiting for data...</div>'; labels.innerHTML = ''; return; }
+    var max = Math.max.apply(null, data.map(function(d){return d.count}).concat([1]));
+    el.innerHTML = data.map(function(d) {
+        var h = Math.max((d.count/max)*56, 1);
+        return '<div class="timeline-bar" style="height:'+h+'px" title="'+d.minute+': '+d.count+'"></div>';
+    }).join('');
+    if (data.length > 2) {
+        labels.innerHTML = '<span>'+data[0].minute+'</span><span>'+data[Math.floor(data.length/2)].minute+'</span><span>'+data[data.length-1].minute+'</span>';
+    }
+}
+
+function renderRecent(items) {
+    var el = document.getElementById('recent-list');
+    if (!items.length) { el.innerHTML = '<div style="color:var(--dim);padding:8px">No requests yet</div>'; return; }
+    el.innerHTML = items.slice(0,12).map(function(r) {
+        return '<div class="recent-row">'
+        + '<span class="time">'+r.time+'</span>'
+        + '<span class="method m-'+r.method+'">'+r.method+'</span>'
+        + '<span class="rpath">'+esc(r.path)+'</span>'
+        + '<span class="tag t-'+r.type+'">'+r.type+'</span>'
+        + '<span class="c-'+r.confidence+'" style="font-size:0.85em">'+r.confidence.charAt(0).toUpperCase()+'</span>'
+        + '</div>';
+    }).join('');
+}
+
+function renderFlow(flows) {
+    var tbody = document.querySelector('#flow-table tbody');
+    if (!flows.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:var(--dim)">No flows yet</td></tr>'; return; }
+    tbody.innerHTML = flows.slice(0,15).map(function(f) {
+        return '<tr>'
+        + '<td>'+esc(f.source)+'</td>'
+        + '<td class="flow-arrow">&#x2192;</td>'
+        + '<td><span class="tag t-'+f.type+'">'+f.type+'</span></td>'
+        + '<td class="flow-arrow">&#x2192;</td>'
+        + '<td>'+esc(f.path)+'</td>'
+        + '<td style="color:var(--green)">'+f.count+'</td>'
+        + '<td style="color:var(--dim)">'+f.last+'</td>'
+        + '</tr>';
+    }).join('');
+}
+
+function formatUptime(sec) {
+    if (sec < 60) return Math.floor(sec) + 's';
+    if (sec < 3600) return Math.floor(sec/60) + 'm';
+    if (sec < 86400) return Math.floor(sec/3600) + 'h ' + Math.floor((sec%3600)/60) + 'm';
+    return Math.floor(sec/86400) + 'd ' + Math.floor((sec%86400)/3600) + 'h';
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+</script>
+</body></html>
