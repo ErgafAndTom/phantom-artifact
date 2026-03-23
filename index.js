@@ -16,27 +16,171 @@ const MAX_LOG_SIZE = 5 * 1024 * 1024;
 const PORT = process.env.PORT || 3000;
 const PHANTOM_DOMAIN = process.env.PHANTOM_DOMAIN || 'localhost';
 
-// In-memory ring buffer for inspector UI (last 200 requests)
+// ─── In-memory stores ───
 const REQUEST_BUFFER = [];
 const MAX_BUFFER = 200;
-
-// SSE clients for live inspector
 const sseClients = new Set();
+
+// ─── STATS ENGINE ───
+const stats = {
+    total: 0,
+    started: new Date().toISOString(),
+    byMethod: {},          // GET: 12, POST: 45
+    byType: {},            // webhook: 30, oauth: 5, api: 10
+    bySource: {},          // stripe: 4, github: 8, telegram: 2
+    byConfidence: {},      // high: 20, medium: 10, low: 5
+    byPath: {},            // /webhook/stripe: 4, /echo/test: 12
+    byHour: {},            // "2026-03-24T01": 5, "2026-03-24T02": 12
+    byMinute: [],          // rolling last 60 minutes [{minute:"HH:MM", count:N}]
+    byIP: {},              // ip -> count
+    byUserAgent: {},       // shortened UA -> count
+    byStatusCode: {},      // 200: 100, 404: 2
+    topPaths: [],          // computed on read
+    topIPs: [],            // computed on read
+    recentPredictions: [], // last 20 predictions with details
+    flowMap: [],           // source -> type -> path connections
+};
+
+// Minute-level bucketing (rolling 60 min)
+const MINUTE_BUCKETS = {};
+
+function recordStats(entry, statusCode) {
+    stats.total++;
+
+    // Method
+    stats.byMethod[entry.method] = (stats.byMethod[entry.method] || 0) + 1;
+
+    // Predict type, source, confidence
+    const predicted = entry.predicted || {};
+    const pType = predicted.type || 'unknown';
+    const pSource = predicted.source || 'unknown';
+    const pConf = predicted.confidence || 'low';
+
+    stats.byType[pType] = (stats.byType[pType] || 0) + 1;
+    stats.bySource[pSource] = (stats.bySource[pSource] || 0) + 1;
+    stats.byConfidence[pConf] = (stats.byConfidence[pConf] || 0) + 1;
+
+    // Path (normalize to first 2 segments)
+    const pathKey = entry.path.split('/').slice(0, 3).join('/') || '/';
+    stats.byPath[pathKey] = (stats.byPath[pathKey] || 0) + 1;
+
+    // Hour bucket
+    const hourKey = entry.timestamp.substring(0, 13); // "2026-03-24T01"
+    stats.byHour[hourKey] = (stats.byHour[hourKey] || 0) + 1;
+
+    // Minute bucket (rolling)
+    const minKey = entry.timestamp.substring(11, 16); // "01:23"
+    MINUTE_BUCKETS[minKey] = (MINUTE_BUCKETS[minKey] || 0) + 1;
+    // Clean old minutes (keep last 60)
+    const allMinutes = Object.keys(MINUTE_BUCKETS).sort();
+    if (allMinutes.length > 60) {
+        delete MINUTE_BUCKETS[allMinutes[0]];
+    }
+
+    // IP
+    if (entry.ip) {
+        stats.byIP[entry.ip] = (stats.byIP[entry.ip] || 0) + 1;
+    }
+
+    // User Agent (shorten)
+    const rawUA = entry.headers?.['user-agent'] || 'unknown';
+    const shortUA = shortenUA(rawUA);
+    stats.byUserAgent[shortUA] = (stats.byUserAgent[shortUA] || 0) + 1;
+
+    // Status code
+    stats.byStatusCode[statusCode] = (stats.byStatusCode[statusCode] || 0) + 1;
+
+    // Recent predictions (last 20)
+    stats.recentPredictions.unshift({
+        time: entry.timestamp.substring(11, 19),
+        method: entry.method,
+        path: entry.path,
+        type: pType,
+        source: pSource,
+        confidence: pConf,
+        ip: entry.ip
+    });
+    if (stats.recentPredictions.length > 20) stats.recentPredictions.pop();
+
+    // Flow map (last 50 unique flows)
+    const flowKey = `${pSource}→${pType}→${pathKey}`;
+    const existingFlow = stats.flowMap.find(f => f.key === flowKey);
+    if (existingFlow) {
+        existingFlow.count++;
+        existingFlow.last = entry.timestamp.substring(11, 19);
+    } else {
+        stats.flowMap.unshift({ key: flowKey, source: pSource, type: pType, path: pathKey, count: 1, last: entry.timestamp.substring(11, 19) });
+        if (stats.flowMap.length > 50) stats.flowMap.pop();
+    }
+}
+
+function shortenUA(ua) {
+    if (ua.includes('curl')) return 'curl';
+    if (ua.includes('Postman')) return 'Postman';
+    if (ua.includes('Insomnia')) return 'Insomnia';
+    if (ua.includes('node-fetch') || ua.includes('undici')) return 'Node.js';
+    if (ua.includes('python-requests') || ua.includes('aiohttp')) return 'Python';
+    if (ua.includes('Go-http-client')) return 'Go';
+    if (ua.includes('axios')) return 'Axios';
+    if (ua.includes('Stripe')) return 'Stripe';
+    if (ua.includes('GitHub-Hookshot')) return 'GitHub';
+    if (ua.includes('TelegramBot')) return 'Telegram';
+    if (ua.includes('Chrome')) return 'Chrome';
+    if (ua.includes('Firefox')) return 'Firefox';
+    if (ua.includes('Safari') && !ua.includes('Chrome')) return 'Safari';
+    if (ua.includes('bot') || ua.includes('Bot')) return 'Bot';
+    if (ua.includes('UptimeRobot') || ua.includes('pingdom')) return 'Monitor';
+    if (ua.length > 40) return ua.substring(0, 30) + '...';
+    return ua || 'unknown';
+}
+
+function getComputedStats() {
+    // Top paths
+    const topPaths = Object.entries(stats.byPath)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 15)
+        .map(([path, count]) => ({ path, count }));
+
+    // Top IPs
+    const topIPs = Object.entries(stats.byIP)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([ip, count]) => ({ ip, count }));
+
+    // Timeline (last hours)
+    const hourEntries = Object.entries(stats.byHour)
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .slice(-24)
+        .map(([hour, count]) => ({ hour: hour.substring(11) + ':00', count }));
+
+    // Minutes timeline
+    const minuteEntries = Object.entries(MINUTE_BUCKETS)
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([minute, count]) => ({ minute, count }));
+
+    return {
+        ...stats,
+        uptime: process.uptime(),
+        topPaths,
+        topIPs,
+        timeline: hourEntries,
+        minuteTimeline: minuteEntries,
+        byMinute: undefined, // don't send raw
+        byIP: undefined,     // send topIPs instead
+        byPath: undefined    // send topPaths instead
+    };
+}
 
 // ─── Log rotation ───
 function rotateLogIfNeeded() {
     try {
-        const stats = fs.statSync(LOG_FILE);
-        if (stats.size > MAX_LOG_SIZE) {
+        const s = fs.statSync(LOG_FILE);
+        if (s.size > MAX_LOG_SIZE) {
             const rotated = LOG_FILE + '.' + Date.now();
             fs.renameSync(LOG_FILE, rotated);
             const dir = path.dirname(LOG_FILE);
             const base = path.basename(LOG_FILE);
-            const rotatedFiles = fs.readdirSync(dir)
-                .filter(f => f.startsWith(base + '.'))
-                .sort()
-                .reverse();
-            rotatedFiles.slice(3).forEach(f => fs.unlinkSync(path.join(dir, f)));
+            fs.readdirSync(dir).filter(f => f.startsWith(base + '.')).sort().reverse().slice(3).forEach(f => fs.unlinkSync(path.join(dir, f)));
         }
     } catch {}
 }
@@ -50,12 +194,11 @@ app.use((req, res, next) => {
     next();
 });
 
-// ─── Middleware: log everything + push to inspector ───
+// ─── Middleware: log + predict + stats ───
+const SKIP_LOG = new Set(['/', '/inspector', '/inspector/events', '/inspector/clear', '/stats', '/stats/events', '/favicon.ico']);
+
 app.use((req, res, next) => {
-    // Skip inspector/SSE routes from logging
-    if (req.path === '/inspector' || req.path === '/inspector/events' || req.path === '/inspector/clear') {
-        return next();
-    }
+    if (SKIP_LOG.has(req.path)) return next();
 
     const entry = {
         id: crypto.randomUUID(),
@@ -72,26 +215,29 @@ app.use((req, res, next) => {
             'referer': req.headers['referer'],
             'accept': req.headers['accept']
         },
-        body: req.body && Object.keys(req.body).length ? req.body : (typeof req.body === 'string' && req.body.length ? req.body : undefined),
+        body: req.body && Object.keys(req.body).length ? req.body : undefined,
         ip: req.ip,
         predicted: predictRequest(req)
     };
 
-    // Clean undefined values from headers
     Object.keys(entry.headers).forEach(k => entry.headers[k] === undefined && delete entry.headers[k]);
 
-    // File log
     rotateLogIfNeeded();
     fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n');
 
-    // Ring buffer for inspector
     REQUEST_BUFFER.push(entry);
     if (REQUEST_BUFFER.length > MAX_BUFFER) REQUEST_BUFFER.shift();
 
-    // Push to SSE clients
-    for (const client of sseClients) {
-        client.write(`data: ${JSON.stringify(entry)}\n\n`);
-    }
+    // Stats
+    const origEnd = res.end;
+    res.end = function(...args) {
+        recordStats(entry, res.statusCode);
+        // Push to SSE
+        for (const client of sseClients) {
+            client.write(`data: ${JSON.stringify(entry)}\n\n`);
+        }
+        origEnd.apply(res, args);
+    };
 
     req.phantomId = entry.id;
     req.phantomPredicted = entry.predicted;
@@ -105,369 +251,116 @@ function predictRequest(req) {
     const ua = (req.headers['user-agent'] || '').toLowerCase();
     const body = req.body;
     const method = req.method;
+    const result = { type: 'unknown', source: 'unknown', confidence: 'low', suggestion: '', handler_template: '' };
 
-    const result = {
-        type: 'unknown',
-        source: 'unknown',
-        confidence: 'low',
-        suggestion: '',
-        handler_template: ''
-    };
-
-    // --- Webhook detection ---
     if (p.includes('webhook') || p.includes('hook') || p.includes('callback')) {
-        result.type = 'webhook';
-        result.confidence = 'high';
-
-        // Stripe
+        result.type = 'webhook'; result.confidence = 'high';
         if (req.headers['stripe-signature'] || (body && body.type && body.data && body.data.object)) {
             result.source = 'stripe';
-            result.suggestion = 'Stripe webhook event. Verify signature with stripe.webhooks.constructEvent()';
-            result.handler_template = `app.post('/webhook/stripe', (req, res) => {\n  const sig = req.headers['stripe-signature'];\n  const event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);\n  switch(event.type) {\n    case '${body?.type || 'payment_intent.succeeded'}':\n      // handle\n      break;\n  }\n  res.json({received: true});\n});`;
-            return result;
-        }
-
-        // GitHub
-        if (req.headers['x-github-event'] || req.headers['x-github-delivery']) {
+            result.suggestion = 'Stripe webhook. Verify with stripe.webhooks.constructEvent()';
+            result.handler_template = `app.post('/webhook/stripe', (req, res) => {\n  const sig = req.headers['stripe-signature'];\n  const event = stripe.webhooks.constructEvent(req.body, sig, secret);\n  switch(event.type) {\n    case '${body?.type || 'payment_intent.succeeded'}': break;\n  }\n  res.json({received: true});\n});`;
+        } else if (req.headers['x-github-event'] || req.headers['x-github-delivery']) {
             result.source = 'github';
-            const event = req.headers['x-github-event'] || 'push';
-            result.suggestion = `GitHub ${event} event. Verify with X-Hub-Signature-256.`;
-            result.handler_template = `app.post('/webhook/github', (req, res) => {\n  const event = req.headers['x-github-event'];\n  const payload = req.body;\n  // Verify: crypto.timingSafeEqual(hmac, signature)\n  switch(event) {\n    case '${event}': /* handle */ break;\n  }\n  res.status(200).send('ok');\n});`;
-            return result;
-        }
-
-        // Telegram
-        if (body && (body.update_id !== undefined || body.message || body.callback_query)) {
+            result.suggestion = `GitHub ${req.headers['x-github-event'] || 'push'} event`;
+            result.handler_template = `app.post('/webhook/github', (req, res) => {\n  const event = req.headers['x-github-event'];\n  // verify X-Hub-Signature-256\n  res.status(200).send('ok');\n});`;
+        } else if (body && (body.update_id !== undefined || body.message || body.callback_query)) {
             result.source = 'telegram';
-            result.suggestion = 'Telegram Bot webhook update. Set via bot.setWebhook(url).';
-            result.handler_template = `app.post('/webhook/telegram', (req, res) => {\n  const { message, callback_query } = req.body;\n  if (message?.text) {\n    // handle text: message.text, chat: message.chat.id\n  }\n  res.sendStatus(200);\n});`;
-            return result;
-        }
-
-        // Monobank
-        if (body && body.invoiceId && body.status) {
+            result.suggestion = 'Telegram Bot update';
+            result.handler_template = `app.post('/webhook/telegram', (req, res) => {\n  const { message } = req.body;\n  if (message?.text) { /* handle */ }\n  res.sendStatus(200);\n});`;
+        } else if (body && body.invoiceId && body.status) {
             result.source = 'monobank';
-            result.suggestion = 'Monobank payment callback. Verify invoiceId against your records.';
-            result.handler_template = `app.post('/webhook/monobank', (req, res) => {\n  const { invoiceId, status, amount } = req.body;\n  if (status === 'success') {\n    // update order by invoiceId\n  }\n  res.sendStatus(200);\n});`;
-            return result;
-        }
-
-        // Notion
-        if (body && (body.verification_token || (body.type && body.type.startsWith('page')))) {
+            result.suggestion = 'Monobank payment callback';
+            result.handler_template = `app.post('/webhook/monobank', (req, res) => {\n  const { invoiceId, status } = req.body;\n  // verify & update order\n  res.sendStatus(200);\n});`;
+        } else if (body && (body.verification_token || (body.type && String(body.type).startsWith('page')))) {
             result.source = 'notion';
-            result.suggestion = 'Notion webhook/automation event.';
-            result.handler_template = `app.post('/webhook/notion', (req, res) => {\n  if (req.body.verification_token) {\n    return res.json({ challenge: req.body.verification_token });\n  }\n  // handle event\n  res.json({ ok: true });\n});`;
-            return result;
-        }
-
-        // Generic webhook
-        result.source = 'generic';
-        result.suggestion = 'Unknown webhook. Log body and headers to identify the service.';
-        result.handler_template = `app.post('${req.path}', (req, res) => {\n  console.log('webhook:', JSON.stringify(req.body));\n  res.json({ received: true });\n});`;
-        return result;
-    }
-
-    // --- OAuth detection ---
-    if (p.includes('oauth') || p.includes('authorize') || p.includes('token') || req.query.code || req.query.grant_type) {
-        result.type = 'oauth';
-        result.confidence = 'high';
-
-        if (req.query.code || p.includes('callback')) {
-            result.source = 'oauth-callback';
-            result.suggestion = 'OAuth authorization code callback. Exchange code for token.';
-            result.handler_template = `app.get('/oauth/callback', async (req, res) => {\n  const { code, state } = req.query;\n  const token = await exchangeCodeForToken(code);\n  // store token, redirect user\n  res.redirect('/dashboard');\n});`;
-        } else if (method === 'POST' && (p.includes('token') || req.query.grant_type)) {
-            result.source = 'oauth-token-exchange';
-            result.suggestion = 'Token exchange request. Return access_token + refresh_token.';
-            result.handler_template = `app.post('/oauth/token', (req, res) => {\n  const { grant_type, code, refresh_token } = req.body;\n  // validate & issue tokens\n  res.json({\n    access_token: '...',\n    token_type: 'bearer',\n    expires_in: 3600\n  });\n});`;
+            result.suggestion = 'Notion webhook event';
+            result.handler_template = `app.post('/webhook/notion', (req, res) => {\n  if (req.body.verification_token) return res.json({challenge: req.body.verification_token});\n  res.json({ok: true});\n});`;
         } else {
-            result.source = 'oauth-authorize';
-            result.suggestion = 'OAuth authorization request. Show consent screen or redirect with code.';
+            result.source = 'generic'; result.suggestion = 'Unknown webhook — check headers/body';
+            result.handler_template = `app.post('${req.path}', (req, res) => {\n  console.log(req.body);\n  res.json({received: true});\n});`;
         }
         return result;
     }
 
-    // --- Payment detection ---
+    if (p.includes('oauth') || p.includes('authorize') || p.includes('token') || req.query.code || req.query.grant_type) {
+        result.type = 'oauth'; result.confidence = 'high';
+        if (req.query.code || p.includes('callback')) {
+            result.source = 'oauth-callback'; result.suggestion = 'OAuth code callback — exchange for token';
+        } else if (method === 'POST' && (p.includes('token') || req.query.grant_type)) {
+            result.source = 'oauth-token'; result.suggestion = 'Token exchange request';
+        } else {
+            result.source = 'oauth-authorize'; result.suggestion = 'OAuth authorization request';
+        }
+        return result;
+    }
+
     if (p.includes('payment') || p.includes('charge') || p.includes('refund') || p.includes('checkout') || p.includes('invoice')) {
-        result.type = 'payment';
-        result.confidence = 'medium';
-        result.source = body?.currency ? 'payment-api' : 'payment-generic';
-        result.suggestion = `Payment-related request. ${body?.amount ? `Amount: ${body.amount} ${body.currency || ''}` : 'Parse amount from body.'}`;
-        result.handler_template = `app.post('${req.path}', (req, res) => {\n  const { amount, currency, orderId } = req.body;\n  // process payment\n  res.json({ status: 'ok', transactionId: crypto.randomUUID() });\n});`;
+        result.type = 'payment'; result.confidence = 'medium'; result.source = 'payment-api';
+        result.suggestion = `Payment request${body?.amount ? ': ' + body.amount + ' ' + (body.currency || '') : ''}`;
         return result;
     }
 
-    // --- API/REST detection ---
     if (p.startsWith('/api/') || ct.includes('json')) {
-        result.type = 'api';
-        result.confidence = 'medium';
-
-        if (method === 'GET') {
-            result.suggestion = 'API GET request — likely fetching data. Return JSON array or object.';
-        } else if (method === 'POST') {
-            result.suggestion = 'API POST — likely creating a resource. Return 201 with created object.';
-        } else if (method === 'PUT' || method === 'PATCH') {
-            result.suggestion = 'API update request. Return updated resource.';
-        } else if (method === 'DELETE') {
-            result.suggestion = 'API delete request. Return 204 or confirmation.';
-        }
-
-        result.source = 'rest-api';
-        result.handler_template = `app.${method.toLowerCase()}('${req.path}', (req, res) => {\n  // handle ${method}\n  res.status(${method === 'POST' ? 201 : method === 'DELETE' ? 204 : 200}).json({ ok: true });\n});`;
+        result.type = 'api'; result.confidence = 'medium'; result.source = 'rest-api';
+        result.suggestion = `REST ${method} — ${method === 'POST' ? 'create' : method === 'GET' ? 'read' : method === 'DELETE' ? 'delete' : 'update'}`;
         return result;
     }
 
-    // --- Health check detection ---
     if (p.includes('health') || p.includes('ping') || p.includes('status') || p.includes('ready')) {
-        result.type = 'health-check';
-        result.confidence = 'high';
-        result.source = 'monitoring';
-        result.suggestion = 'Health check probe (likely Kubernetes, UptimeRobot, or load balancer).';
-        result.handler_template = `app.get('${req.path}', (req, res) => {\n  res.json({ status: 'ok', uptime: process.uptime() });\n});`;
+        result.type = 'health-check'; result.confidence = 'high'; result.source = 'monitoring';
+        result.suggestion = 'Health/readiness probe';
         return result;
     }
 
-    // --- Bot/Crawler detection ---
-    if (ua.includes('bot') || ua.includes('crawler') || ua.includes('spider') || ua.includes('curl') || ua.includes('postman') || ua.includes('insomnia')) {
-        result.type = 'tool-request';
-        result.confidence = 'medium';
-        if (ua.includes('curl')) result.source = 'curl';
-        else if (ua.includes('postman')) result.source = 'postman';
-        else if (ua.includes('insomnia')) result.source = 'insomnia';
-        else result.source = 'bot/crawler';
-        result.suggestion = `Request from ${result.source}. Probably manual testing.`;
+    if (ua.includes('bot') || ua.includes('curl') || ua.includes('postman') || ua.includes('insomnia')) {
+        result.type = 'tool-request'; result.confidence = 'medium';
+        result.source = ua.includes('curl') ? 'curl' : ua.includes('postman') ? 'postman' : ua.includes('insomnia') ? 'insomnia' : 'bot';
+        result.suggestion = `Request from ${result.source}`;
         return result;
     }
 
-    // --- Fallback ---
-    result.suggestion = 'Unrecognized request pattern. Check headers and body for clues.';
+    result.suggestion = 'Unrecognized pattern';
     return result;
 }
 
-// ─── REQUEST INSPECTOR UI ───
-app.get('/inspector', (req, res) => {
-    res.type('text/html').send(`<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Phantom Inspector</title>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace; background: #0a0a0a; color: #c0c0c0; }
-.header { background: #111; border-bottom: 1px solid #222; padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 10; }
-.header h1 { color: #00ff41; font-size: 1em; }
-.header .controls { display: flex; gap: 8px; align-items: center; }
-.header .controls button { background: #1a1a1a; color: #888; border: 1px solid #333; padding: 4px 12px; font-family: inherit; font-size: 0.75em; cursor: pointer; border-radius: 3px; }
-.header .controls button:hover { color: #00ff41; border-color: #00ff41; }
-.badge { background: #00ff41; color: #0a0a0a; padding: 2px 8px; border-radius: 10px; font-size: 0.7em; font-weight: bold; margin-left: 8px; }
-.badge.off { background: #ff4141; }
-.container { display: flex; height: calc(100vh - 45px); }
-.list { width: 420px; border-right: 1px solid #222; overflow-y: auto; flex-shrink: 0; }
-.detail { flex: 1; overflow-y: auto; padding: 16px; }
-.entry { padding: 10px 14px; border-bottom: 1px solid #1a1a1a; cursor: pointer; transition: background 0.1s; }
-.entry:hover { background: #151515; }
-.entry.active { background: #0a2a0a; border-left: 3px solid #00ff41; }
-.entry .method { display: inline-block; width: 52px; font-weight: bold; font-size: 0.75em; }
-.entry .path { color: #ddd; font-size: 0.8em; }
-.entry .meta { color: #555; font-size: 0.65em; margin-top: 3px; }
-.entry .predict-tag { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.6em; margin-left: 4px; }
-.m-GET { color: #4fc3f7; } .m-POST { color: #81c784; } .m-PUT { color: #ffb74d; }
-.m-PATCH { color: #ce93d8; } .m-DELETE { color: #ef5350; } .m-OPTIONS { color: #666; }
-.t-webhook { background: #1a2a1a; color: #81c784; } .t-oauth { background: #1a1a2a; color: #90caf9; }
-.t-payment { background: #2a2a1a; color: #ffb74d; } .t-api { background: #1a1a1a; color: #aaa; }
-.t-health-check { background: #0a2a2a; color: #4fc3f7; } .t-unknown { background: #1a1a1a; color: #666; }
-.t-tool-request { background: #2a1a2a; color: #ce93d8; }
-.section { margin-bottom: 20px; }
-.section h3 { color: #00ff41; font-size: 0.85em; margin-bottom: 8px; border-bottom: 1px solid #222; padding-bottom: 4px; }
-pre { background: #111; padding: 12px; border: 1px solid #222; border-radius: 4px; font-size: 0.78em; overflow-x: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
-.predict-box { background: #0a1a0a; border: 1px solid #1a3a1a; border-radius: 4px; padding: 12px; margin-bottom: 16px; }
-.predict-box .type { color: #00ff41; font-weight: bold; font-size: 0.9em; }
-.predict-box .source { color: #4fc3f7; font-size: 0.8em; }
-.predict-box .suggestion { color: #ccc; font-size: 0.8em; margin-top: 6px; }
-.predict-box .confidence { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.65em; font-weight: bold; }
-.c-high { background: #1a3a1a; color: #81c784; } .c-medium { background: #2a2a1a; color: #ffb74d; } .c-low { background: #2a1a1a; color: #ef5350; }
-.code-template { position: relative; }
-.code-template .copy-btn { position: absolute; top: 4px; right: 4px; background: #222; color: #888; border: 1px solid #333; padding: 2px 8px; font-size: 0.7em; cursor: pointer; border-radius: 3px; font-family: inherit; }
-.code-template .copy-btn:hover { color: #00ff41; border-color: #00ff41; }
-.empty { text-align: center; color: #444; padding: 60px 20px; }
-.empty h2 { color: #333; margin-bottom: 8px; font-size: 1em; }
-.empty code { background: #111; padding: 2px 6px; color: #888; }
-.live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #00ff41; margin-right: 6px; animation: pulse 2s infinite; }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-.filter-bar { padding: 8px 14px; border-bottom: 1px solid #222; background: #0d0d0d; }
-.filter-bar input { width: 100%; background: #111; border: 1px solid #222; color: #ccc; padding: 5px 10px; font-family: inherit; font-size: 0.75em; border-radius: 3px; outline: none; }
-.filter-bar input:focus { border-color: #00ff41; }
-</style></head><body>
-<div class="header">
-  <h1>\u{1F47B} Phantom Inspector <span class="badge" id="statusBadge"><span class="live-dot"></span>LIVE</span></h1>
-  <div class="controls">
-    <span id="counter" style="color:#555;font-size:0.75em;">0 requests</span>
-    <button onclick="togglePause()" id="pauseBtn">Pause</button>
-    <button onclick="clearAll()">Clear</button>
-  </div>
-</div>
-<div class="container">
-  <div class="list">
-    <div class="filter-bar"><input id="filter" placeholder="Filter by path, method, type..." oninput="applyFilter()"></div>
-    <div id="entries"></div>
-  </div>
-  <div class="detail" id="detail">
-    <div class="empty">
-      <h2>No request selected</h2>
-      <p>Send a request to this server and click it in the list.</p>
-      <p style="margin-top:12px;font-size:0.8em;color:#555;">
-        Try: <code>curl ${PHANTOM_DOMAIN !== 'localhost' ? 'https://' + PHANTOM_DOMAIN : 'http://localhost:' + PORT}/test</code>
-      </p>
-    </div>
-  </div>
-</div>
-<script>
-const entries = [];
-let paused = false;
-let selected = null;
-let filterText = '';
-
-const es = new EventSource('/inspector/events');
-es.onmessage = (e) => {
-  if (paused) return;
-  const entry = JSON.parse(e.data);
-  entries.unshift(entry);
-  if (entries.length > 200) entries.pop();
-  render();
-};
-es.onerror = () => {
-  document.getElementById('statusBadge').className = 'badge off';
-  document.getElementById('statusBadge').innerHTML = 'DISCONNECTED';
-};
-
-function togglePause() {
-  paused = !paused;
-  document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
-  const b = document.getElementById('statusBadge');
-  if (paused) { b.className = 'badge off'; b.innerHTML = 'PAUSED'; }
-  else { b.className = 'badge'; b.innerHTML = '<span class="live-dot"></span>LIVE'; }
-}
-
-function clearAll() {
-  entries.length = 0;
-  selected = null;
-  render();
-  document.getElementById('detail').innerHTML = '<div class="empty"><h2>Cleared</h2></div>';
-  fetch('/inspector/clear', { method: 'POST' });
-}
-
-function applyFilter() {
-  filterText = document.getElementById('filter').value.toLowerCase();
-  render();
-}
-
-function render() {
-  const filtered = entries.filter(e => {
-    if (!filterText) return true;
-    return (e.method + ' ' + e.path + ' ' + (e.predicted?.type || '') + ' ' + (e.predicted?.source || '')).toLowerCase().includes(filterText);
-  });
-  document.getElementById('counter').textContent = entries.length + ' requests';
-  const el = document.getElementById('entries');
-  el.innerHTML = filtered.map((e, i) => {
-    const pt = e.predicted?.type || 'unknown';
-    return '<div class="entry' + (selected === e.id ? ' active' : '') + '" onclick="showDetail(\\'' + e.id + '\\')">'
-      + '<span class="method m-' + e.method + '">' + e.method + '</span> '
-      + '<span class="path">' + escH(e.path) + '</span>'
-      + '<span class="predict-tag t-' + pt + '">' + pt + '</span>'
-      + '<div class="meta">' + e.timestamp.substring(11, 19) + ' \u00b7 ' + (e.ip || '') + (e.predicted?.source && e.predicted.source !== 'unknown' ? ' \u00b7 ' + e.predicted.source : '') + '</div>'
-      + '</div>';
-  }).join('');
-}
-
-function showDetail(id) {
-  selected = id;
-  const e = entries.find(x => x.id === id);
-  if (!e) return;
-  render();
-
-  const pr = e.predicted || {};
-  let html = '';
-
-  // Predict box
-  html += '<div class="predict-box">'
-    + '<div><span class="type">' + (pr.type || 'unknown') + '</span>'
-    + ' <span class="confidence ' + 'c-' + (pr.confidence || 'low') + '">' + (pr.confidence || 'low') + '</span></div>'
-    + '<div class="source">' + (pr.source || '') + '</div>'
-    + '<div class="suggestion">' + escH(pr.suggestion || '') + '</div>'
-    + '</div>';
-
-  // Handler template
-  if (pr.handler_template) {
-    html += '<div class="section"><h3>\u{1F4CB} Suggested Handler</h3>'
-      + '<div class="code-template"><button class="copy-btn" onclick="copyCode(this)">Copy</button>'
-      + '<pre>' + escH(pr.handler_template) + '</pre></div></div>';
-  }
-
-  // Request details
-  html += '<div class="section"><h3>\u{1F4E8} Request</h3><pre>'
-    + escH(e.method + ' ' + e.path + (e.query && Object.keys(e.query).length ? '?' + new URLSearchParams(e.query) : ''))
-    + '</pre></div>';
-
-  // Headers
-  if (e.headers && Object.keys(e.headers).length) {
-    html += '<div class="section"><h3>\u{1F4E4} Headers</h3><pre>'
-      + escH(JSON.stringify(e.headers, null, 2)) + '</pre></div>';
-  }
-
-  // Body
-  if (e.body) {
-    html += '<div class="section"><h3>\u{1F4E6} Body</h3><pre>'
-      + escH(typeof e.body === 'object' ? JSON.stringify(e.body, null, 2) : String(e.body)) + '</pre></div>';
-  }
-
-  // Query
-  if (e.query && Object.keys(e.query).length) {
-    html += '<div class="section"><h3>\u{1F50E} Query Params</h3><pre>'
-      + escH(JSON.stringify(e.query, null, 2)) + '</pre></div>';
-  }
-
-  // Raw
-  html += '<div class="section"><h3>\u{1F9FE} Raw Entry</h3><pre>'
-    + escH(JSON.stringify(e, null, 2)) + '</pre></div>';
-
-  document.getElementById('detail').innerHTML = html;
-}
-
-function copyCode(btn) {
-  const code = btn.nextElementSibling.textContent;
-  navigator.clipboard.writeText(code).then(() => {
-    btn.textContent = 'Copied!';
-    setTimeout(() => btn.textContent = 'Copy', 1500);
-  });
-}
-
-function escH(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-</script>
-</body></html>`);
+// ─── STATS API ───
+app.get('/stats', (req, res) => {
+    if (req.headers.accept?.includes('text/html')) {
+        return res.redirect('/');
+    }
+    res.json(getComputedStats());
 });
 
-// SSE endpoint for live inspector
+app.get('/stats/events', (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+    res.write('\n');
+
+    // Send stats every 3 seconds
+    const interval = setInterval(() => {
+        res.write(`data: ${JSON.stringify(getComputedStats())}\n\n`);
+    }, 3000);
+
+    req.on('close', () => clearInterval(interval));
+});
+
+// ─── INSPECTOR ───
+app.get('/inspector', (req, res) => {
+    res.type('text/html').send(inspectorHTML());
+});
+
 app.get('/inspector/events', (req, res) => {
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'
-    });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.write('\n');
     sseClients.add(res);
     req.on('close', () => sseClients.delete(res));
 });
 
-// Clear inspector buffer
 app.post('/inspector/clear', (req, res) => {
     REQUEST_BUFFER.length = 0;
     res.json({ cleared: true });
 });
 
-// ─── ECHO/MIRROR MODE ───
-// Returns exactly what was received — headers, body, query, method
+// ─── ECHO/MIRROR ───
 app.all('/echo', echoHandler);
 app.all('/echo/*', echoHandler);
 app.all('/mirror', echoHandler);
@@ -475,62 +368,28 @@ app.all('/mirror/*', echoHandler);
 
 function echoHandler(req, res) {
     const echo = {
-        phantom: true,
-        mode: 'echo',
-        request: {
-            method: req.method,
-            path: req.path,
-            url: req.originalUrl,
-            query: req.query,
-            headers: { ...req.headers },
-            body: req.body,
-            ip: req.ip,
-            protocol: req.protocol,
-            hostname: req.hostname
-        },
+        phantom: true, mode: 'echo',
+        request: { method: req.method, path: req.path, url: req.originalUrl, query: req.query, headers: { ...req.headers }, body: req.body, ip: req.ip, protocol: req.protocol, hostname: req.hostname },
         predicted: req.phantomPredicted,
         timestamp: new Date().toISOString()
     };
-
-    // Remove sensitive proxy headers
     delete echo.request.headers['x-forwarded-for'];
     delete echo.request.headers['x-forwarded-proto'];
-    delete echo.request.headers['x-forwarded-host'];
-
-    // Support custom response via query params
     const status = parseInt(req.query._status) || 200;
-    const delay = parseInt(req.query._delay) || 0;
-
-    if (delay > 0) {
-        setTimeout(() => res.status(status).json(echo), Math.min(delay, 30000));
-    } else {
-        res.status(status).json(echo);
-    }
+    const delay = Math.min(parseInt(req.query._delay) || 0, 30000);
+    if (delay > 0) setTimeout(() => res.status(status).json(echo), delay);
+    else res.status(status).json(echo);
 }
 
-// ─── .well-known — domain verification ───
+// ─── .well-known ───
 app.get('/.well-known/openid-configuration', (req, res) => {
     const host = PHANTOM_DOMAIN !== 'localhost' ? PHANTOM_DOMAIN : req.hostname;
-    res.json({
-        issuer: `https://${host}`,
-        authorization_endpoint: `https://${host}/oauth/authorize`,
-        token_endpoint: `https://${host}/oauth/token`,
-        jwks_uri: `https://${host}/.well-known/jwks.json`,
-        response_types_supported: ['code', 'token'],
-        grant_types_supported: ['authorization_code', 'client_credentials']
-    });
+    res.json({ issuer: `https://${host}`, authorization_endpoint: `https://${host}/oauth/authorize`, token_endpoint: `https://${host}/oauth/token`, jwks_uri: `https://${host}/.well-known/jwks.json`, response_types_supported: ['code', 'token'], grant_types_supported: ['authorization_code', 'client_credentials'] });
 });
-
 app.get('/.well-known/assetlinks.json', (req, res) => {
-    res.json([{
-        relation: ['delegate_permission/common.handle_all_urls'],
-        target: { namespace: 'web', site: `https://${req.hostname}` }
-    }]);
+    res.json([{ relation: ['delegate_permission/common.handle_all_urls'], target: { namespace: 'web', site: `https://${req.hostname}` } }]);
 });
-
-app.get('/.well-known/*', (req, res) => {
-    res.json({ status: 'verified', phantom: true, path: req.path });
-});
+app.get('/.well-known/*', (req, res) => { res.json({ status: 'verified', phantom: true, path: req.path }); });
 
 // ─── OAuth mock ───
 app.get('/oauth/authorize', (req, res) => {
@@ -541,261 +400,417 @@ app.get('/oauth/authorize', (req, res) => {
         if (state) url.searchParams.set('state', state);
         return res.redirect(302, url.toString());
     }
-    res.json({
-        code: 'phantom_code_' + Date.now(),
-        state: req.query.state,
-        phantom: true
-    });
+    res.json({ code: 'phantom_code_' + Date.now(), state: req.query.state, phantom: true });
 });
-
 app.post('/oauth/token', (req, res) => {
-    res.json({
-        access_token: 'phantom_at_' + crypto.randomBytes(16).toString('hex'),
-        token_type: 'bearer',
-        expires_in: 3600,
-        refresh_token: 'phantom_rt_' + crypto.randomBytes(16).toString('hex'),
-        scope: req.body?.scope || 'read write',
-        phantom: true
-    });
+    res.json({ access_token: 'phantom_at_' + crypto.randomBytes(16).toString('hex'), token_type: 'bearer', expires_in: 3600, refresh_token: 'phantom_rt_' + crypto.randomBytes(16).toString('hex'), scope: req.body?.scope || 'read write', phantom: true });
 });
 
-// ─── Webhook receivers ───
+// ─── Webhooks ───
 app.post('/webhook/notion', (req, res) => {
-    const body = req.body;
-    if (body && body.verification_token) {
-        console.log('[NOTION] Verification:', body.verification_token);
-        return res.status(200).json({ status: 'ok', verification_received: true });
-    }
-    res.status(200).json({ received: true, phantom: true });
+    if (req.body?.verification_token) return res.json({ status: 'ok', verification_received: true });
+    res.json({ received: true, phantom: true });
 });
+app.post('/webhook/notion-auto', (req, res) => { res.json({ received: true, source: 'notion-automation', phantom: true }); });
+app.all('/webhook/*', (req, res) => { res.json({ received: true, event_id: 'evt_phantom_' + Date.now(), path: req.path, phantom: true }); });
 
-app.post('/webhook/notion-auto', (req, res) => {
-    console.log('[NOTION-AUTO]', JSON.stringify(req.body).substring(0, 500));
-    res.status(200).json({ received: true, source: 'notion-automation', phantom: true });
-});
-
-app.all('/webhook/*', (req, res) => {
-    res.json({
-        received: true,
-        event_id: 'evt_phantom_' + Date.now(),
-        path: req.path,
-        phantom: true
-    });
-});
-
-// ─── Payment gateway mock ───
-app.post('/api/payment/charge', (req, res) => {
-    res.json({
-        status: 'ok',
-        transaction_id: 'tx_' + crypto.randomBytes(8).toString('hex'),
-        amount: req.body?.amount || 0,
-        currency: req.body?.currency || 'UAH',
-        charged: false,
-        phantom: true,
-        message: 'Phantom mode — no real charge'
-    });
-});
-
-app.post('/api/payment/refund', (req, res) => {
-    res.json({
-        status: 'ok',
-        refund_id: 'rf_' + crypto.randomBytes(8).toString('hex'),
-        refunded: false,
-        phantom: true
-    });
-});
+// ─── Payment mock ───
+app.post('/api/payment/charge', (req, res) => { res.json({ status: 'ok', transaction_id: 'tx_' + crypto.randomBytes(8).toString('hex'), amount: req.body?.amount || 0, currency: req.body?.currency || 'UAH', charged: false, phantom: true }); });
+app.post('/api/payment/refund', (req, res) => { res.json({ status: 'ok', refund_id: 'rf_' + crypto.randomBytes(8).toString('hex'), refunded: false, phantom: true }); });
 
 // ─── Health / Identity ───
-app.get('/health', (req, res) => {
-    res.json({ status: 'alive', phantom: true, uptime: process.uptime() });
-});
-
+app.get('/health', (req, res) => { res.json({ status: 'alive', phantom: true, uptime: process.uptime() }); });
 app.get('/identity', (req, res) => {
     const host = PHANTOM_DOMAIN !== 'localhost' ? PHANTOM_DOMAIN : req.hostname;
-    res.json({
-        name: 'phantom-artifact-v2',
-        type: 'dev-testing-toolbox',
-        description: 'Catch-all server for development: receives everything, predicts request type, suggests handlers, mirrors requests',
-        layers: {
-            eth: 'PhantomSink contract (deploy via CREATE2)',
-            dns: host,
-            api: `https://${host}`
-        },
-        features: [
-            'Request Inspector UI — live stream of all requests',
-            'Predict Engine — identifies webhook source, suggests handler code',
-            'Echo/Mirror Mode — returns exactly what was received',
-            'Webhook receiver — any path under /webhook/*',
-            'OAuth mock provider — /oauth/authorize, /oauth/token',
-            'Payment mock — /api/payment/charge, /api/payment/refund',
-            'Domain verification — /.well-known/*',
-            'Catch-all — everything else returns 200 OK'
-        ],
-        endpoints: [
-            'GET  /inspector       — live request inspector UI',
-            'ALL  /echo/*          — echo/mirror mode',
-            'ALL  /mirror/*        — echo/mirror mode (alias)',
-            'GET  /identity        — this info',
-            'GET  /health          — status',
-            'GET  /logs            — last 50 logged requests',
-            'ALL  /webhook/*       — webhook receiver',
-            'GET  /oauth/authorize — OAuth authorize',
-            'POST /oauth/token     — OAuth token exchange',
-            'POST /api/payment/*   — payment mock',
-            'GET  /.well-known/*   — domain verification',
-            'ALL  /*               — catch-all (logs + 200 OK + predict)'
-        ]
-    });
+    res.json({ name: 'phantom-artifact-v2', type: 'dev-testing-toolbox', host, features: ['inspector', 'predict-engine', 'echo-mirror', 'stats-dashboard', 'webhook-catcher', 'oauth-mock', 'payment-mock'], endpoints: Object.keys(stats.byPath) });
 });
 
 // ─── Logs ───
 app.get('/logs', (req, res) => {
     try {
-        const logs = fs.readFileSync(LOG_FILE, 'utf-8')
-            .trim()
-            .split('\n')
-            .slice(-50)
-            .map(l => JSON.parse(l));
+        const logs = fs.readFileSync(LOG_FILE, 'utf-8').trim().split('\n').slice(-50).map(l => JSON.parse(l));
         res.json({ count: logs.length, entries: logs });
-    } catch {
-        res.json({ count: 0, entries: [] });
-    }
+    } catch { res.json({ count: 0, entries: [] }); }
 });
 
-// ─── HTML landing ───
+// ─── LANDING = TERMINAL + STATS DASHBOARD ───
 app.get('/', (req, res) => {
     const host = PHANTOM_DOMAIN !== 'localhost' ? PHANTOM_DOMAIN : `localhost:${PORT}`;
     const baseUrl = PHANTOM_DOMAIN !== 'localhost' ? `https://${PHANTOM_DOMAIN}` : `http://localhost:${PORT}`;
 
-    if (req.headers.accept?.includes('text/html')) {
-        return res.send(`<!DOCTYPE html>
-<html><head><title>Phantom Artifact</title>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace; background: #0a0a0a; color: #c0c0c0; padding: 40px; max-width: 800px; margin: 0 auto; line-height: 1.6; }
-h1 { color: #00ff41; font-size: 1.5em; margin-bottom: 4px; }
-h2 { color: #00ff41; font-size: 1em; margin: 24px 0 8px; border-bottom: 1px solid #222; padding-bottom: 4px; }
-.sub { color: #666; font-size: 0.85em; margin-bottom: 24px; }
-a { color: #4fc3f7; text-decoration: none; }
-a:hover { text-decoration: underline; }
-code { background: #1a1a1a; padding: 2px 6px; color: #00ff41; border-radius: 2px; font-size: 0.9em; }
-pre { background: #111; padding: 16px; overflow-x: auto; border: 1px solid #222; border-radius: 4px; margin: 8px 0; font-size: 0.85em; }
-.feature { display: flex; gap: 12px; margin: 8px 0; padding: 8px 0; }
-.feature .icon { flex-shrink: 0; font-size: 1.2em; }
-.feature .text { flex: 1; }
-.feature .text strong { color: #ddd; }
-.feature .text p { color: #888; font-size: 0.85em; }
-.hero-btn { display: inline-block; background: #00ff41; color: #0a0a0a; padding: 10px 24px; font-weight: bold; font-family: inherit; border-radius: 4px; margin: 16px 8px 16px 0; }
-.hero-btn:hover { text-decoration: none; background: #00cc33; }
-.hero-btn.secondary { background: transparent; color: #00ff41; border: 1px solid #00ff41; }
-.hero-btn.secondary:hover { background: #0a2a0a; }
-</style></head><body>
-<h1>\u{1F47B} Phantom Artifact <span style="color:#555;font-size:0.6em;">v2</span></h1>
-<p class="sub">Dev Testing Toolbox \u2014 catch-all server that receives everything, predicts what it is, and suggests how to handle it.</p>
-
-<a class="hero-btn" href="/inspector">Open Inspector</a>
-<a class="hero-btn secondary" href="/identity">API Info</a>
-
-<h2>What it does</h2>
-
-<div class="feature">
-  <div class="icon">\u{1F50D}</div>
-  <div class="text">
-    <strong>Request Inspector</strong>
-    <p>Live web UI showing every incoming request in real-time. See headers, body, query params, and predicted request type.</p>
-  </div>
-</div>
-
-<div class="feature">
-  <div class="icon">\u{1F9E0}</div>
-  <div class="text">
-    <strong>Predict Engine</strong>
-    <p>Automatically identifies the request \u2014 Stripe webhook? GitHub push? Telegram bot? OAuth callback? Shows confidence level and generates a handler template you can copy.</p>
-  </div>
-</div>
-
-<div class="feature">
-  <div class="icon">\u{1FA9E}</div>
-  <div class="text">
-    <strong>Echo/Mirror</strong>
-    <p>Send anything to <code>/echo/*</code> \u2014 get back exactly what you sent. Debug your client. Add <code>?_delay=2000</code> to test timeouts, <code>?_status=500</code> for error responses.</p>
-  </div>
-</div>
-
-<div class="feature">
-  <div class="icon">\u{1F4E1}</div>
-  <div class="text">
-    <strong>Webhook Catcher</strong>
-    <p>Point any webhook to <code>/webhook/anything</code> \u2014 always responds 200 OK, logs everything for inspection.</p>
-  </div>
-</div>
-
-<div class="feature">
-  <div class="icon">\u{1F511}</div>
-  <div class="text">
-    <strong>OAuth Mock</strong>
-    <p>Full OAuth2 flow: <code>/oauth/authorize</code>, <code>/oauth/token</code>, <code>/.well-known/openid-configuration</code>. Test your OAuth integration without a real provider.</p>
-  </div>
-</div>
-
-<div class="feature">
-  <div class="icon">\u{1F4B3}</div>
-  <div class="text">
-    <strong>Payment Mock</strong>
-    <p><code>/api/payment/charge</code> and <code>/api/payment/refund</code> \u2014 returns valid-looking responses without processing real money.</p>
-  </div>
-</div>
-
-<h2>Quick Start</h2>
-<pre>
-# Test webhook
-curl -X POST ${baseUrl}/webhook/stripe \\
-  -H "Content-Type: application/json" \\
-  -d '{"type":"payment_intent.succeeded","data":{"object":{"amount":2000}}}'
-
-# Echo with delay
-curl ${baseUrl}/echo/test?_delay=3000&_status=201
-
-# Mirror your request
-curl -X POST ${baseUrl}/mirror \\
-  -H "Content-Type: application/json" \\
-  -H "X-Custom: hello" \\
-  -d '{"test": true}'
-
-# Open inspector
-open ${baseUrl}/inspector
-</pre>
-
-<h2>Philosophy</h2>
-<p style="color:#555;font-size:0.85em;"><code>/dev/null</code> meets <code>RequestBin</code> meets <code>json-server</code> \u2014 one URL that handles everything during development.</p>
-
-<p style="margin-top:24px;font-size:0.8em;color:#333;">
-  ETH Layer: deploy <code>PhantomSink.sol</code> via CREATE2 for on-chain identity \u00b7
-  <a href="https://github.com/ErgafAndTom/phantom-artifact">GitHub</a>
-</p>
-</body></html>`);
+    if (!req.headers.accept?.includes('text/html')) {
+        return res.json({ phantom: true, identity: 'phantom-artifact-v2', inspector: '/inspector', stats: '/stats' });
     }
-    res.json({ phantom: true, identity: 'phantom-artifact-v2', inspector: '/inspector' });
+
+    res.type('text/html').send(`<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phantom Artifact</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0a;--surface:#111;--border:#1a1a1a;--border2:#222;--green:#00ff41;--green2:#0a2a0a;--dim:#444;--text:#999;--bright:#ccc;--blue:#4fc3f7;--orange:#ffb74d;--red:#ef5350;--purple:#ce93d8;--cyan:#00bcd4;--yellow:#ffd740}
+body{font-family:'JetBrains Mono','Fira Code','Courier New',monospace;background:var(--bg);color:var(--text);min-height:100vh}
+.terminal{max-width:1100px;margin:0 auto;padding:20px}
+
+/* Top bar */
+.top{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--border2);margin-bottom:20px}
+.top h1{color:var(--green);font-size:1.1em;letter-spacing:1px}
+.top .meta{font-size:0.7em;color:var(--dim)}
+.live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);margin-right:4px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.badge{background:var(--green);color:var(--bg);padding:2px 8px;border-radius:10px;font-size:0.65em;font-weight:bold}
+
+/* Grid */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+@media(max-width:700px){.grid{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--border2);border-radius:6px;padding:14px}
+.card h3{color:var(--green);font-size:0.78em;margin-bottom:10px;text-transform:uppercase;letter-spacing:1px}
+.card.wide{grid-column:1/-1}
+
+/* Big numbers */
+.big-nums{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+.big-num{background:var(--surface);border:1px solid var(--border2);border-radius:6px;padding:14px 20px;flex:1;min-width:120px;text-align:center}
+.big-num .val{font-size:1.8em;color:var(--green);font-weight:bold;line-height:1}
+.big-num .label{font-size:0.65em;color:var(--dim);margin-top:4px;text-transform:uppercase}
+
+/* Bar chart (CSS) */
+.bar-chart{display:flex;flex-direction:column;gap:4px}
+.bar-row{display:flex;align-items:center;gap:8px;font-size:0.75em}
+.bar-row .bar-label{width:90px;text-align:right;color:var(--text);flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-row .bar-track{flex:1;height:18px;background:var(--bg);border-radius:2px;overflow:hidden;position:relative}
+.bar-row .bar-fill{height:100%;border-radius:2px;transition:width .5s ease;min-width:2px}
+.bar-row .bar-count{width:40px;text-align:right;color:var(--dim);flex-shrink:0;font-size:0.85em}
+
+/* Timeline chart (sparkline) */
+.timeline-chart{height:60px;display:flex;align-items:flex-end;gap:1px;padding:4px 0}
+.timeline-bar{flex:1;background:var(--green);border-radius:1px 1px 0 0;min-width:2px;transition:height .5s ease;opacity:.7;position:relative}
+.timeline-bar:hover{opacity:1}
+.timeline-labels{display:flex;justify-content:space-between;font-size:0.6em;color:var(--dim);margin-top:2px}
+
+/* Flow table */
+.flow-table{width:100%;font-size:0.72em;border-collapse:collapse}
+.flow-table th{text-align:left;color:var(--dim);font-weight:normal;padding:4px 8px;border-bottom:1px solid var(--border2)}
+.flow-table td{padding:4px 8px;border-bottom:1px solid var(--border)}
+.flow-table .flow-arrow{color:var(--dim)}
+.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:0.85em}
+.t-webhook{background:#1a2a1a;color:#81c784}.t-oauth{background:#1a1a2a;color:#90caf9}
+.t-payment{background:#2a2a1a;color:var(--orange)}.t-api{background:#1a1a1a;color:#aaa}
+.t-health-check{background:#0a2a2a;color:var(--blue)}.t-unknown{background:#1a1a1a;color:#666}
+.t-tool-request{background:#2a1a2a;color:var(--purple)}
+
+/* Recent list */
+.recent{font-size:0.72em}
+.recent-row{display:flex;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);align-items:center}
+.recent-row .time{color:var(--dim);width:55px;flex-shrink:0}
+.recent-row .method{width:40px;font-weight:bold;flex-shrink:0}
+.m-GET{color:var(--blue)}.m-POST{color:#81c784}.m-PUT{color:var(--orange)}.m-DELETE{color:var(--red)}.m-PATCH{color:var(--purple)}
+.recent-row .rpath{color:var(--bright);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.c-high{color:#81c784}.c-medium{color:var(--orange)}.c-low{color:var(--red)}
+
+/* Nav links */
+.nav{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.nav a{color:var(--green);text-decoration:none;border:1px solid var(--border2);padding:6px 14px;border-radius:4px;font-size:0.75em;transition:all .15s}
+.nav a:hover{border-color:var(--green);background:var(--green2)}
+
+/* Prompt line */
+.prompt{margin-top:20px;padding:12px 0;border-top:1px solid var(--border2);font-size:0.75em;color:var(--dim)}
+.prompt span{color:var(--green)}
+.cursor{display:inline-block;width:8px;height:14px;background:var(--green);animation:blink 1s step-end infinite;vertical-align:text-bottom;margin-left:2px}
+@keyframes blink{50%{opacity:0}}
+
+/* Color palette for bars */
+.clr-0{background:var(--green)}.clr-1{background:var(--blue)}.clr-2{background:var(--orange)}.clr-3{background:var(--purple)}.clr-4{background:var(--cyan)}.clr-5{background:var(--yellow)}.clr-6{background:var(--red)}.clr-7{background:#66bb6a}
+</style></head><body>
+<div class="terminal">
+
+<div class="top">
+  <h1>\u{1F47B} phantom-artifact <span style="color:var(--dim);font-size:0.7em">v2</span></h1>
+  <div class="meta"><span class="badge"><span class="live-dot"></span>LIVE</span> &nbsp; <span id="uptime">0s</span></div>
+</div>
+
+<div class="nav">
+  <a href="/inspector">\u{1F50D} Inspector</a>
+  <a href="/echo/test">\u{1FA9E} Echo</a>
+  <a href="/identity">\u{1F4CB} Identity</a>
+  <a href="/logs">\u{1F4DC} Logs</a>
+  <a href="/stats">\u{1F4CA} Stats JSON</a>
+  <a href="https://github.com/ErgafAndTom/phantom-artifact" target="_blank">\u{1F4BB} GitHub</a>
+</div>
+
+<div class="big-nums">
+  <div class="big-num"><div class="val" id="s-total">0</div><div class="label">Requests</div></div>
+  <div class="big-num"><div class="val" id="s-types">0</div><div class="label">Types Seen</div></div>
+  <div class="big-num"><div class="val" id="s-sources">0</div><div class="label">Sources</div></div>
+  <div class="big-num"><div class="val" id="s-ips">0</div><div class="label">Unique IPs</div></div>
+</div>
+
+<div class="card wide">
+  <h3>\u{1F4C8} Requests / Minute</h3>
+  <div class="timeline-chart" id="chart-timeline"></div>
+  <div class="timeline-labels" id="chart-timeline-labels"></div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>\u{1F3AF} By Type (Predict)</h3>
+    <div class="bar-chart" id="chart-type"></div>
+  </div>
+  <div class="card">
+    <h3>\u{1F310} By Source</h3>
+    <div class="bar-chart" id="chart-source"></div>
+  </div>
+  <div class="card">
+    <h3>\u{1F6E0}\u{FE0F} By Method</h3>
+    <div class="bar-chart" id="chart-method"></div>
+  </div>
+  <div class="card">
+    <h3>\u{1F916} By Client</h3>
+    <div class="bar-chart" id="chart-ua"></div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>\u{1F525} Top Paths</h3>
+    <div class="bar-chart" id="chart-paths"></div>
+  </div>
+  <div class="card">
+    <h3>\u{1F4E1} Recent Requests</h3>
+    <div class="recent" id="recent-list"></div>
+  </div>
+</div>
+
+<div class="card wide">
+  <h3>\u{1F504} Flow Map (source \u2192 type \u2192 path)</h3>
+  <table class="flow-table" id="flow-table">
+    <thead><tr><th>Source</th><th></th><th>Type</th><th></th><th>Path</th><th>Count</th><th>Last</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="prompt">
+  <span>phantom@artifact</span>:<span style="color:var(--blue)">~</span>$ curl ${baseUrl}/webhook/test<span class="cursor"></span>
+</div>
+
+</div>
+
+<script>
+const COLORS = ['clr-0','clr-1','clr-2','clr-3','clr-4','clr-5','clr-6','clr-7'];
+const TYPE_COLORS = {webhook:'var(--green)',oauth:'var(--blue)',payment:'var(--orange)',api:'#aaa','health-check':'var(--cyan)',unknown:'#666','tool-request':'var(--purple)'};
+const METHOD_COLORS = {GET:'var(--blue)',POST:'#81c784',PUT:'var(--orange)',DELETE:'var(--red)',PATCH:'var(--purple)',OPTIONS:'#666'};
+
+const es = new EventSource('/stats/events');
+es.onmessage = (e) => {
+    try { update(JSON.parse(e.data)); } catch(err) { console.error(err); }
+};
+
+function update(s) {
+    // Big numbers
+    document.getElementById('s-total').textContent = s.total;
+    document.getElementById('s-types').textContent = Object.keys(s.byType || {}).length;
+    document.getElementById('s-sources').textContent = Object.keys(s.bySource || {}).length;
+    document.getElementById('s-ips').textContent = (s.topIPs || []).length;
+    document.getElementById('uptime').textContent = formatUptime(s.uptime || 0);
+
+    // Timeline
+    renderTimeline(s.minuteTimeline || []);
+
+    // Bar charts
+    renderBars('chart-type', s.byType, TYPE_COLORS);
+    renderBars('chart-source', s.bySource);
+    renderBars('chart-method', s.byMethod, METHOD_COLORS);
+    renderBars('chart-ua', s.byUserAgent);
+
+    // Top paths
+    renderBars('chart-paths', Object.fromEntries((s.topPaths||[]).map(p=>[p.path,p.count])));
+
+    // Recent
+    renderRecent(s.recentPredictions || []);
+
+    // Flow
+    renderFlow(s.flowMap || []);
+}
+
+function renderBars(id, data, colorMap) {
+    const el = document.getElementById(id);
+    if (!data || !Object.keys(data).length) { el.innerHTML = '<div style="color:var(--dim);font-size:0.75em;padding:8px">No data yet</div>'; return; }
+    const sorted = Object.entries(data).sort((a,b) => b[1]-a[1]).slice(0,8);
+    const max = sorted[0][1] || 1;
+    el.innerHTML = sorted.map(([key,val],i) => {
+        const pct = Math.max((val/max)*100, 2);
+        const color = colorMap?.[key] || ('var(--green)');
+        const clr = colorMap ? '' : COLORS[i % COLORS.length];
+        return '<div class="bar-row">'
+            + '<span class="bar-label" title="'+esc(key)+'">'+esc(key)+'</span>'
+            + '<span class="bar-track"><span class="bar-fill '+(clr)+'" style="width:'+pct+'%;'+(colorMap?'background:'+color:'')+'">&nbsp;</span></span>'
+            + '<span class="bar-count">'+val+'</span>'
+            + '</div>';
+    }).join('');
+}
+
+function renderTimeline(data) {
+    const el = document.getElementById('chart-timeline');
+    const labels = document.getElementById('chart-timeline-labels');
+    if (!data.length) { el.innerHTML = '<div style="color:var(--dim);font-size:0.75em;padding:20px">Waiting for data...</div>'; labels.innerHTML = ''; return; }
+    const max = Math.max(...data.map(d=>d.count), 1);
+    el.innerHTML = data.map(d => {
+        const h = Math.max((d.count/max)*56, 1);
+        return '<div class="timeline-bar" style="height:'+h+'px" title="'+d.minute+': '+d.count+'"></div>';
+    }).join('');
+    if (data.length > 2) {
+        labels.innerHTML = '<span>'+data[0].minute+'</span><span>'+data[Math.floor(data.length/2)].minute+'</span><span>'+data[data.length-1].minute+'</span>';
+    }
+}
+
+function renderRecent(items) {
+    const el = document.getElementById('recent-list');
+    if (!items.length) { el.innerHTML = '<div style="color:var(--dim);padding:8px">No requests yet</div>'; return; }
+    el.innerHTML = items.slice(0,12).map(r =>
+        '<div class="recent-row">'
+        + '<span class="time">'+r.time+'</span>'
+        + '<span class="method m-'+r.method+'">'+r.method+'</span>'
+        + '<span class="rpath">'+esc(r.path)+'</span>'
+        + '<span class="tag t-'+r.type+'">'+r.type+'</span>'
+        + '<span class="c-'+r.confidence+'" style="font-size:0.85em">'+r.confidence.charAt(0).toUpperCase()+'</span>'
+        + '</div>'
+    ).join('');
+}
+
+function renderFlow(flows) {
+    const tbody = document.querySelector('#flow-table tbody');
+    if (!flows.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:var(--dim)">No flows yet</td></tr>'; return; }
+    tbody.innerHTML = flows.slice(0,15).map(f =>
+        '<tr>'
+        + '<td>'+esc(f.source)+'</td>'
+        + '<td class="flow-arrow">\u2192</td>'
+        + '<td><span class="tag t-'+f.type+'">'+f.type+'</span></td>'
+        + '<td class="flow-arrow">\u2192</td>'
+        + '<td>'+esc(f.path)+'</td>'
+        + '<td style="color:var(--green)">'+f.count+'</td>'
+        + '<td style="color:var(--dim)">'+f.last+'</td>'
+        + '</tr>'
+    ).join('');
+}
+
+function formatUptime(sec) {
+    if (sec < 60) return Math.floor(sec) + 's';
+    if (sec < 3600) return Math.floor(sec/60) + 'm';
+    if (sec < 86400) return Math.floor(sec/3600) + 'h ' + Math.floor((sec%3600)/60) + 'm';
+    return Math.floor(sec/86400) + 'd ' + Math.floor((sec%86400)/3600) + 'h';
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+</script>
+</body></html>`);
 });
 
 // ─── Catch-all ───
 app.all('*', (req, res) => {
-    res.json({
-        status: 'ok',
-        phantom: true,
-        request_id: req.phantomId,
-        predicted: req.phantomPredicted,
-        echo: {
-            method: req.method,
-            path: req.path,
-            query: req.query
-        }
-    });
+    res.json({ status: 'ok', phantom: true, request_id: req.phantomId, predicted: req.phantomPredicted, echo: { method: req.method, path: req.path, query: req.query } });
 });
 
 app.listen(PORT, () => {
     console.log(`\u{1F47B} Phantom Artifact v2 listening on :${PORT}`);
+    console.log(`   Dashboard \u2192 http://localhost:${PORT}/`);
     console.log(`   Inspector \u2192 http://localhost:${PORT}/inspector`);
-    console.log(`   Identity  \u2192 http://localhost:${PORT}/identity`);
-    console.log(`   Logs      \u2192 ${LOG_FILE}`);
+    console.log(`   Stats API \u2192 http://localhost:${PORT}/stats`);
 });
+
+// ─── Inspector HTML (separate function to keep main flow clean) ───
+function inspectorHTML() {
+    return `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phantom Inspector</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'JetBrains Mono','Fira Code','Courier New',monospace;background:#0a0a0a;color:#c0c0c0}
+.header{background:#111;border-bottom:1px solid #222;padding:12px 20px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:10}
+.header h1{color:#00ff41;font-size:1em}
+.header .controls{display:flex;gap:8px;align-items:center}
+.header .controls button{background:#1a1a1a;color:#888;border:1px solid #333;padding:4px 12px;font-family:inherit;font-size:.75em;cursor:pointer;border-radius:3px}
+.header .controls button:hover{color:#00ff41;border-color:#00ff41}
+.badge{background:#00ff41;color:#0a0a0a;padding:2px 8px;border-radius:10px;font-size:.7em;font-weight:bold;margin-left:8px}
+.badge.off{background:#ff4141}
+.container{display:flex;height:calc(100vh - 45px)}
+.list{width:420px;border-right:1px solid #222;overflow-y:auto;flex-shrink:0}
+.detail{flex:1;overflow-y:auto;padding:16px}
+.entry{padding:10px 14px;border-bottom:1px solid #1a1a1a;cursor:pointer;transition:background .1s}
+.entry:hover{background:#151515}
+.entry.active{background:#0a2a0a;border-left:3px solid #00ff41}
+.entry .method{display:inline-block;width:52px;font-weight:bold;font-size:.75em}
+.entry .path{color:#ddd;font-size:.8em}
+.entry .meta{color:#555;font-size:.65em;margin-top:3px}
+.entry .predict-tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:.6em;margin-left:4px}
+.m-GET{color:#4fc3f7}.m-POST{color:#81c784}.m-PUT{color:#ffb74d}.m-PATCH{color:#ce93d8}.m-DELETE{color:#ef5350}
+.t-webhook{background:#1a2a1a;color:#81c784}.t-oauth{background:#1a1a2a;color:#90caf9}.t-payment{background:#2a2a1a;color:#ffb74d}.t-api{background:#1a1a1a;color:#aaa}.t-health-check{background:#0a2a2a;color:#4fc3f7}.t-unknown{background:#1a1a1a;color:#666}.t-tool-request{background:#2a1a2a;color:#ce93d8}
+.section{margin-bottom:20px}
+.section h3{color:#00ff41;font-size:.85em;margin-bottom:8px;border-bottom:1px solid #222;padding-bottom:4px}
+pre{background:#111;padding:12px;border:1px solid #222;border-radius:4px;font-size:.78em;overflow-x:auto;white-space:pre-wrap;word-break:break-all;line-height:1.5}
+.predict-box{background:#0a1a0a;border:1px solid #1a3a1a;border-radius:4px;padding:12px;margin-bottom:16px}
+.predict-box .type{color:#00ff41;font-weight:bold;font-size:.9em}
+.predict-box .source{color:#4fc3f7;font-size:.8em}
+.predict-box .suggestion{color:#ccc;font-size:.8em;margin-top:6px}
+.predict-box .confidence{display:inline-block;padding:2px 6px;border-radius:3px;font-size:.65em;font-weight:bold}
+.c-high{background:#1a3a1a;color:#81c784}.c-medium{background:#2a2a1a;color:#ffb74d}.c-low{background:#2a1a1a;color:#ef5350}
+.code-template{position:relative}
+.code-template .copy-btn{position:absolute;top:4px;right:4px;background:#222;color:#888;border:1px solid #333;padding:2px 8px;font-size:.7em;cursor:pointer;border-radius:3px;font-family:inherit}
+.code-template .copy-btn:hover{color:#00ff41;border-color:#00ff41}
+.empty{text-align:center;color:#444;padding:60px 20px}
+.empty h2{color:#333;margin-bottom:8px;font-size:1em}
+.empty code{background:#111;padding:2px 6px;color:#888}
+.live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#00ff41;margin-right:6px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.filter-bar{padding:8px 14px;border-bottom:1px solid #222;background:#0d0d0d}
+.filter-bar input{width:100%;background:#111;border:1px solid #222;color:#ccc;padding:5px 10px;font-family:inherit;font-size:.75em;border-radius:3px;outline:none}
+.filter-bar input:focus{border-color:#00ff41}
+.back-link{color:#00ff41;text-decoration:none;font-size:.8em;margin-left:12px}
+</style></head><body>
+<div class="header">
+  <h1>\u{1F47B} Inspector <a class="back-link" href="/">\u2190 Dashboard</a> <span class="badge" id="statusBadge"><span class="live-dot"></span>LIVE</span></h1>
+  <div class="controls">
+    <span id="counter" style="color:#555;font-size:.75em">0</span>
+    <button onclick="togglePause()" id="pauseBtn">Pause</button>
+    <button onclick="clearAll()">Clear</button>
+  </div>
+</div>
+<div class="container">
+  <div class="list">
+    <div class="filter-bar"><input id="filter" placeholder="Filter..." oninput="applyFilter()"></div>
+    <div id="entries"></div>
+  </div>
+  <div class="detail" id="detail"><div class="empty"><h2>No request selected</h2><p>Send a request and click it here.</p></div></div>
+</div>
+<script>
+const entries=[];let paused=false,selected=null,filterText='';
+const es=new EventSource('/inspector/events');
+es.onmessage=(e)=>{if(paused)return;const entry=JSON.parse(e.data);entries.unshift(entry);if(entries.length>200)entries.pop();render()};
+es.onerror=()=>{document.getElementById('statusBadge').className='badge off';document.getElementById('statusBadge').innerHTML='DISCONNECTED'};
+function togglePause(){paused=!paused;document.getElementById('pauseBtn').textContent=paused?'Resume':'Pause';const b=document.getElementById('statusBadge');if(paused){b.className='badge off';b.innerHTML='PAUSED'}else{b.className='badge';b.innerHTML='<span class="live-dot"></span>LIVE'}}
+function clearAll(){entries.length=0;selected=null;render();document.getElementById('detail').innerHTML='<div class="empty"><h2>Cleared</h2></div>';fetch('/inspector/clear',{method:'POST'})}
+function applyFilter(){filterText=document.getElementById('filter').value.toLowerCase();render()}
+function render(){
+  const f=entries.filter(e=>!filterText||(e.method+' '+e.path+' '+(e.predicted?.type||'')+' '+(e.predicted?.source||'')).toLowerCase().includes(filterText));
+  document.getElementById('counter').textContent=entries.length+' req';
+  document.getElementById('entries').innerHTML=f.map(e=>{
+    const pt=e.predicted?.type||'unknown';
+    return '<div class="entry'+(selected===e.id?' active':'')+'" onclick="showDetail(\\''+e.id+'\\')">'
+      +'<span class="method m-'+e.method+'">'+e.method+'</span> <span class="path">'+esc(e.path)+'</span>'
+      +'<span class="predict-tag t-'+pt+'">'+pt+'</span>'
+      +'<div class="meta">'+e.timestamp.substring(11,19)+' \xb7 '+(e.ip||'')+'</div></div>';
+  }).join('');
+}
+function showDetail(id){
+  selected=id;const e=entries.find(x=>x.id===id);if(!e)return;render();
+  const pr=e.predicted||{};let h='';
+  h+='<div class="predict-box"><div><span class="type">'+(pr.type||'?')+'</span> <span class="confidence c-'+(pr.confidence||'low')+'">'+(pr.confidence||'?')+'</span></div><div class="source">'+(pr.source||'')+'</div><div class="suggestion">'+esc(pr.suggestion||'')+'</div></div>';
+  if(pr.handler_template)h+='<div class="section"><h3>Handler</h3><div class="code-template"><button class="copy-btn" onclick="navigator.clipboard.writeText(this.nextElementSibling.textContent).then(()=>{this.textContent=\\'Copied!\\';setTimeout(()=>this.textContent=\\'Copy\\',1500)})">Copy</button><pre>'+esc(pr.handler_template)+'</pre></div></div>';
+  h+='<div class="section"><h3>Request</h3><pre>'+esc(e.method+' '+e.path)+'</pre></div>';
+  if(e.headers&&Object.keys(e.headers).length)h+='<div class="section"><h3>Headers</h3><pre>'+esc(JSON.stringify(e.headers,null,2))+'</pre></div>';
+  if(e.body)h+='<div class="section"><h3>Body</h3><pre>'+esc(typeof e.body==='object'?JSON.stringify(e.body,null,2):String(e.body))+'</pre></div>';
+  h+='<div class="section"><h3>Raw</h3><pre>'+esc(JSON.stringify(e,null,2))+'</pre></div>';
+  document.getElementById('detail').innerHTML=h;
+}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+</script></body></html>`;
+}
