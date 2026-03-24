@@ -63,6 +63,28 @@ pre{background:#111;padding:12px;border:1px solid #222;border-radius:4px;font-si
 </div>
 <script>
 var entries=[];var paused=false;var selected=null;var filterText='';
+
+// Load history from DB on page open
+fetch('/db?limit=100').then(function(r){return r.json()}).then(function(d){
+    if(d.requests && d.requests.length){
+        d.requests.reverse().forEach(function(r){
+            entries.unshift({
+                id: r.id,
+                timestamp: r.timestamp || new Date().toISOString(),
+                method: r.method,
+                path: r.path,
+                query: r.query_params,
+                headers: r.headers,
+                body: r.body ? (function(){try{return JSON.parse(r.body)}catch(e){return r.body}})() : null,
+                ip: r.ip,
+                predicted: {type: r.predict_type, source: r.predict_source, confidence: r.predict_confidence, suggestion: r.predict_suggestion, handler_template: r.handler_template}
+            });
+        });
+        render();
+        document.getElementById('counter').textContent=entries.length+' req ('+d.total+' in DB)';
+    }
+}).catch(function(e){console.warn('DB history load failed:',e)});
+
 var es=new EventSource('/inspector/events');
 es.onmessage=function(e){if(paused)return;var entry=JSON.parse(e.data);entries.unshift(entry);if(entries.length>200)entries.pop();render()};
 es.onerror=function(){document.getElementById('statusBadge').className='badge off';document.getElementById('statusBadge').innerHTML='DISCONNECTED'};

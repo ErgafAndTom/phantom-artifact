@@ -202,6 +202,29 @@ function pvPushPixel(type) {
 }
 
 var pvLastTotal = 0;
+var dbLoaded = false;
+
+// Load historical data from DB first
+fetch('/db/stats').then(function(r){return r.json()}).then(function(s){
+    dbLoaded = true;
+    pvLastTotal = s.total || 0;
+    update(s);
+    // Fill pixel canvas with historical type distribution
+    var types = Object.entries(s.byType || {});
+    types.forEach(function(pair){
+        for(var i=0;i<Math.min(pair[1],100);i++) pvPushPixel(pair[0]);
+    });
+}).catch(function(e){ console.warn('DB stats load failed:', e); });
+
+// Also load recent requests for the recent list
+fetch('/db?limit=20').then(function(r){return r.json()}).then(function(d){
+    if(d.requests && d.requests.length){
+        var items = d.requests.map(function(r){
+            return {time: r.timestamp ? String(r.timestamp).substring(11,19) : '?', method: r.method, path: r.path, type: r.predict_type||'unknown', source: r.predict_source||'unknown', confidence: r.predict_confidence||'low', ip: r.ip};
+        });
+        renderRecent(items);
+    }
+}).catch(function(){});
 
 var es = new EventSource('/stats/events');
 es.onmessage = function(e) {
