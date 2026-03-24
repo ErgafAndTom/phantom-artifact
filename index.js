@@ -2,6 +2,7 @@ const express = require('express');
 const fs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
+const mysql = require('mysql2/promise');
 const app = express();
 
 app.set('trust proxy', true);
@@ -15,6 +16,58 @@ const LOG_FILE = path.join(LOG_DIR, 'phantom.log');
 const MAX_LOG_SIZE = 5 * 1024 * 1024;
 const PORT = process.env.PORT || 3000;
 const PHANTOM_DOMAIN = process.env.PHANTOM_DOMAIN || 'localhost';
+
+// ─── MySQL ───
+const DB_CONFIG = {
+    host: process.env.DB_HOST || '82.193.98.232',
+    port: parseInt(process.env.DB_PORT || '3306'),
+    user: process.env.DB_USER || 'User1',
+    password: process.env.DB_PASS || '1234567890!',
+    database: process.env.DB_NAME || 'phantom_artifact',
+    waitForConnections: true,
+    connectionLimit: 5,
+    queueLimit: 0,
+    connectTimeout: 10000
+};
+
+let dbPool = null;
+try {
+    dbPool = mysql.createPool(DB_CONFIG);
+    console.log('[DB] Pool created for', DB_CONFIG.host);
+} catch(e) {
+    console.error('[DB] Pool creation failed:', e.message);
+}
+
+async function dbSave(entry, statusCode) {
+    if (!dbPool) return;
+    try {
+        await dbPool.execute(
+            `INSERT INTO requests (id, timestamp, method, path, query_params, headers, body, ip, predict_type, predict_source, predict_confidence, predict_suggestion, handler_template, status_code, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                entry.id,
+                new Date(entry.timestamp),
+                entry.method,
+                entry.path,
+                entry.query ? JSON.stringify(entry.query) : null,
+                entry.headers ? JSON.stringify(entry.headers) : null,
+                entry.body ? (typeof entry.body === 'object' ? JSON.stringify(entry.body) : String(entry.body)) : null,
+                entry.ip || null,
+                entry.predicted?.type || null,
+                entry.predicted?.source || null,
+                entry.predicted?.confidence || null,
+                entry.predicted?.suggestion || null,
+                entry.predicted?.handler_template || null,
+                statusCode || 200,
+                entry.headers?.['user-agent'] || null
+            ]
+        );
+    } catch(e) {
+        // Don't crash on DB errors — log and continue
+        if (e.code !== 'ER_DUP_ENTRY') {
+            console.error('[DB] Insert error:', e.code || e.message);
+        }
+    }
+}
 
 // ─── In-memory stores ───
 const REQUEST_BUFFER = [];
@@ -195,7 +248,7 @@ app.use((req, res, next) => {
 });
 
 // ─── Middleware: log + predict + stats ───
-const SKIP_LOG = new Set(['/', '/inspector', '/inspector/events', '/inspector/clear', '/stats', '/stats/events', '/favicon.ico']);
+const SKIP_LOG = new Set(['/', '/inspector', '/inspector/events', '/inspector/clear', '/stats', '/stats/events', '/db', '/db/stats', '/favicon.ico']);
 
 app.use((req, res, next) => {
     if (SKIP_LOG.has(req.path)) return next();
@@ -232,6 +285,7 @@ app.use((req, res, next) => {
     const origEnd = res.end;
     res.end = function(...args) {
         recordStats(entry, res.statusCode);
+        dbSave(entry, res.statusCode);
         // Push to SSE
         for (const client of sseClients) {
             client.write(`data: ${JSON.stringify(entry)}\n\n`);
@@ -443,6 +497,86 @@ app.get('/', (req, res) => {
     }
 
     res.type('text/html').send(LANDING_HTML);
+});
+
+// ─── DB Query API ───
+// /db — all requests from MySQL
+// /db?type=webhook — filter by predict type
+// /db?source=stripe — filter by source
+// /db?method=POST — filter by method
+// /db?ip=1.2.3.4 — filter by IP
+// /db?path=/webhook — filter by path (LIKE)
+// /db?limit=100 — limit results (default 50)
+// /db?from=2026-03-24T00:00 — from timestamp
+// /db?to=2026-03-24T23:59 — to timestamp
+app.get('/db', async (req, res) => {
+    if (!dbPool) return res.status(503).json({ error: 'Database not connected' });
+    try {
+        const conditions = [];
+        const params = [];
+
+        if (req.query.type) { conditions.push('predict_type = ?'); params.push(req.query.type); }
+        if (req.query.source) { conditions.push('predict_source = ?'); params.push(req.query.source); }
+        if (req.query.method) { conditions.push('method = ?'); params.push(req.query.method.toUpperCase()); }
+        if (req.query.ip) { conditions.push('ip = ?'); params.push(req.query.ip); }
+        if (req.query.path) { conditions.push('path LIKE ?'); params.push('%' + req.query.path + '%'); }
+        if (req.query.from) { conditions.push('timestamp >= ?'); params.push(new Date(req.query.from)); }
+        if (req.query.to) { conditions.push('timestamp <= ?'); params.push(new Date(req.query.to)); }
+
+        const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+        const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+
+        const [rows] = await dbPool.query(
+            `SELECT * FROM requests ${where} ORDER BY timestamp DESC LIMIT ?`,
+            [...params, limit]
+        );
+
+        const [countResult] = await dbPool.query(
+            `SELECT COUNT(*) as total FROM requests ${where}`,
+            params
+        );
+
+        res.json({
+            total: countResult[0].total,
+            returned: rows.length,
+            limit,
+            filters: req.query,
+            requests: rows.map(r => {
+                // mysql2 may return JSON columns as objects already
+                try { if (typeof r.query_params === 'string') r.query_params = JSON.parse(r.query_params); } catch{}
+                try { if (typeof r.headers === 'string') r.headers = JSON.parse(r.headers); } catch{}
+                return r;
+            })
+        });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// /db/stats — aggregate stats from DB
+app.get('/db/stats', async (req, res) => {
+    if (!dbPool) return res.status(503).json({ error: 'Database not connected' });
+    try {
+        const [total] = await dbPool.query('SELECT COUNT(*) as cnt FROM requests');
+        const [byType] = await dbPool.query('SELECT predict_type as t, COUNT(*) as c FROM requests GROUP BY predict_type ORDER BY c DESC');
+        const [bySource] = await dbPool.query('SELECT predict_source as s, COUNT(*) as c FROM requests GROUP BY predict_source ORDER BY c DESC');
+        const [byMethod] = await dbPool.query('SELECT method as m, COUNT(*) as c FROM requests GROUP BY method ORDER BY c DESC');
+        const [byHour] = await dbPool.query('SELECT DATE_FORMAT(timestamp, \'%Y-%m-%d %H:00\') as hour, COUNT(*) as c FROM requests GROUP BY hour ORDER BY hour DESC LIMIT 48');
+        const [topPaths] = await dbPool.query('SELECT SUBSTRING_INDEX(path, \'?\', 1) as p, COUNT(*) as c FROM requests GROUP BY p ORDER BY c DESC LIMIT 20');
+        const [topIPs] = await dbPool.query('SELECT ip, COUNT(*) as c FROM requests GROUP BY ip ORDER BY c DESC LIMIT 15');
+
+        res.json({
+            total: total[0].cnt,
+            byType: Object.fromEntries(byType.map(r => [r.t || 'null', r.c])),
+            bySource: Object.fromEntries(bySource.map(r => [r.s || 'null', r.c])),
+            byMethod: Object.fromEntries(byMethod.map(r => [r.m, r.c])),
+            byHour: byHour.map(r => ({ hour: r.hour, count: r.c })),
+            topPaths: topPaths.map(r => ({ path: r.p, count: r.c })),
+            topIPs: topIPs.map(r => ({ ip: r.ip, count: r.c }))
+        });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // ─── Catch-all ───
